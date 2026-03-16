@@ -1,0 +1,22 @@
+{
+  "name": "make-an-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vp run build -r",
+    "check": "vp check",
+    "dev:server": "vp run server#build",
+    "ready": "vp fmt && vp lint && vp run test -r && vp run build -r",
+    "dev": "vp run web#dev",
+    "test": "vp run test -r",
+    "prepare": "vp config"
+  },
+  "devDependencies": {
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@10.32.1"
+}

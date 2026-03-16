@@ -1,0 +1,22 @@
+{
+  "name": "server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "db": "workspace:*",
+    "github": "workspace:*",
+    "pi-runner": "workspace:*",
+    "policy-engine": "workspace:*",
+    "shared": "workspace:*",
+    "task-router": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}
