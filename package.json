@@ -6,7 +6,7 @@
   "scripts": {
     "build": "vp run build -r",
     "check": "vp check",
-    "dev:server": "vp run server#build",
+    "dev:server": "vp run server#dev",
     "ready": "vp fmt && vp lint && vp run test -r && vp run build -r",
     "dev": "vp run web#dev",
     "test": "vp run test -r",

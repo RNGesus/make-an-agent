@@ -442,6 +442,42 @@ label span {
   border: 1px solid rgba(36, 59, 73, 0.08);
 }
 
+.detail-section {
+  display: grid;
+  gap: 10px;
+}
+
+.detail-card,
+.artifact-row {
+  padding: 14px 16px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid rgba(36, 59, 73, 0.08);
+}
+
+.detail-card-stack,
+.artifact-list {
+  display: grid;
+  gap: 10px;
+}
+
+.artifact-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.artifact-row-stack {
+  display: grid;
+  justify-content: stretch;
+}
+
+.artifact-row small,
+.artifact-note {
+  color: var(--muted);
+}
+
 dd {
   margin-top: 4px;
   font-weight: 600;
@@ -504,5 +540,10 @@ code {
   .candidate-meta,
   .detail-row {
     justify-content: flex-start;
+  }
+
+  .artifact-row {
+    flex-direction: column;
+    align-items: start;
   }
 }

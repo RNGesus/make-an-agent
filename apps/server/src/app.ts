@@ -5,16 +5,22 @@ import {
   bootstrapControlPlaneDatabase,
   createTask,
   getTaskDetail,
+  getTaskExecutionContext,
   getRepositoryDetail,
   getRepositoryByRootPath,
   listTasks,
   listRepositories,
+  recordAuditEvent,
   registerRepository,
+  replaceTaskArtifacts,
   type RepositoryPolicyValues,
+  updateTaskExecution,
   updateRepositoryPolicy,
 } from "db/runtime";
+import { evaluatePolicyAction } from "policy-engine";
 import { autonomyModes, taskGoalTypes, type AutonomyMode, type TaskGoalType } from "shared";
 import { resolveTaskRoute } from "task-router";
+import { executePiTask, type PiExecutionRequest } from "pi-runner";
 import type { ServerConfig } from "./config.ts";
 import { defaultServerConfig } from "./config.ts";
 
@@ -288,7 +294,9 @@ async function routeRequest(
         completed_at: null,
       });
 
-      return jsonResponse(request, config, 201, task);
+      const executedTask = await maybeExecuteTask(database, config, task.task.id);
+
+      return jsonResponse(request, config, 201, executedTask);
     } catch (error) {
       return jsonResponse(request, config, 400, {
         error: error instanceof Error ? error.message : "Could not create task.",
@@ -306,6 +314,22 @@ async function routeRequest(
       : jsonResponse(request, config, 404, {
           error: `Task '${taskDetailMatch.taskId}' was not found.`,
         });
+  }
+
+  const taskRetryMatch = matchTaskRetry(url.pathname);
+
+  if (request.method === "POST" && taskRetryMatch) {
+    const detail = getTaskDetail(database, taskRetryMatch.taskId);
+
+    if (!detail) {
+      return jsonResponse(request, config, 404, {
+        error: `Task '${taskRetryMatch.taskId}' was not found.`,
+      });
+    }
+
+    const executedTask = await maybeExecuteTask(database, config, taskRetryMatch.taskId, true);
+
+    return jsonResponse(request, config, 200, executedTask);
   }
 
   return jsonResponse(request, config, 404, {
@@ -483,6 +507,12 @@ function matchRepositoryPolicy(pathname: string) {
 
 function matchTaskDetail(pathname: string) {
   const match = /^\/api\/tasks\/([^/]+)$/.exec(pathname);
+
+  return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
+}
+
+function matchTaskRetry(pathname: string) {
+  const match = /^\/api\/tasks\/([^/]+)\/retry$/.exec(pathname);
 
   return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
 }
@@ -693,6 +723,195 @@ function normalizeTaskTitle(title: string | undefined, userPrompt: string) {
   }
 
   return trimmedPrompt.length <= 72 ? trimmedPrompt : `${trimmedPrompt.slice(0, 69).trimEnd()}...`;
+}
+
+async function maybeExecuteTask(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  config: ServerConfig,
+  taskId: string,
+  isRetry = false,
+) {
+  const context = getTaskExecutionContext(database, taskId);
+
+  if (!context) {
+    throw new Error(`Task '${taskId}' was not found for execution.`);
+  }
+
+  if (!canAutoExecuteTask(context.task.goal_type)) {
+    recordAuditEvent(
+      database,
+      context.repository.id,
+      context.task.id,
+      isRetry ? "task.execution.retry_deferred" : "task.execution.deferred",
+      "Execution is deferred until approval-backed write workflows land.",
+      {
+        goal_type: context.task.goal_type,
+        routing_tier: context.task.routing_tier,
+      },
+    );
+
+    const detail = getTaskDetail(database, taskId);
+
+    if (!detail) {
+      throw new Error(`Task '${taskId}' disappeared after deferring execution.`);
+    }
+
+    return detail;
+  }
+
+  const readDecision = evaluatePolicyAction(context.policy, { kind: "read" });
+
+  if (!readDecision.allowed) {
+    updateTaskExecution(database, taskId, {
+      status: "failed",
+      pi_session_id: context.task.pi_session_id,
+      branch_name: context.task.branch_name,
+      started_at: context.task.started_at,
+      completed_at: new Date().toISOString(),
+    });
+    recordAuditEvent(
+      database,
+      context.repository.id,
+      context.task.id,
+      "task.execution.blocked",
+      readDecision.reason,
+      {
+        action: "read",
+      },
+    );
+
+    const detail = getTaskDetail(database, taskId);
+
+    if (!detail) {
+      throw new Error(`Task '${taskId}' disappeared after read access was denied.`);
+    }
+
+    return detail;
+  }
+
+  const startedAt = new Date().toISOString();
+  updateTaskExecution(database, taskId, {
+    status: "running",
+    pi_session_id: context.task.pi_session_id,
+    branch_name: context.task.branch_name,
+    started_at: startedAt,
+    completed_at: null,
+  });
+  recordAuditEvent(
+    database,
+    context.repository.id,
+    context.task.id,
+    isRetry ? "task.execution.retried" : "task.execution.started",
+    isRetry
+      ? "Retried task execution through the milestone-three runner."
+      : "Started task execution through the milestone-three runner.",
+    {
+      goal_type: context.task.goal_type,
+      routing_tier: context.task.routing_tier,
+    },
+  );
+
+  try {
+    const executionRequest = buildPiExecutionRequest(config, context);
+    const result = await executePiTask(executionRequest);
+
+    replaceTaskArtifacts(
+      database,
+      taskId,
+      result.artifacts.map((artifact) => ({
+        artifact_type: artifact.artifact_type,
+        summary: artifact.summary,
+        payload_json: JSON.stringify(artifact.payload),
+      })),
+    );
+    updateTaskExecution(database, taskId, {
+      status: "completed",
+      pi_session_id: result.session_id,
+      branch_name: context.task.branch_name,
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+    });
+    recordAuditEvent(
+      database,
+      context.repository.id,
+      context.task.id,
+      "task.execution.completed",
+      "Persisted pi session reference and execution artifacts.",
+      {
+        session_id: result.session_id,
+        session_key: result.session_key,
+        artifact_count: result.artifacts.length,
+      },
+    );
+  } catch (error) {
+    updateTaskExecution(database, taskId, {
+      status: "failed",
+      pi_session_id: context.task.pi_session_id,
+      branch_name: context.task.branch_name,
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+    });
+    recordAuditEvent(
+      database,
+      context.repository.id,
+      context.task.id,
+      "task.execution.failed",
+      error instanceof Error ? error.message : "Task execution failed.",
+      {
+        goal_type: context.task.goal_type,
+        routing_tier: context.task.routing_tier,
+      },
+    );
+  }
+
+  const detail = getTaskDetail(database, taskId);
+
+  if (!detail) {
+    throw new Error(`Task '${taskId}' was not available after execution.`);
+  }
+
+  return detail;
+}
+
+function canAutoExecuteTask(goalType: TaskGoalType) {
+  return goalType === "question" || goalType === "plan";
+}
+
+function buildPiExecutionRequest(
+  config: ServerConfig,
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+): PiExecutionRequest {
+  return {
+    mode: config.pi_runner_mode,
+    repo: {
+      id: context.repository.id,
+      name: context.repository.name,
+      root_path: context.repository.root_path,
+      default_branch: context.repository.default_branch,
+    },
+    policy: {
+      allowed_root: context.policy.allowed_root,
+      autonomy_mode: context.policy.autonomy_mode,
+      max_task_budget_usd: context.policy.max_task_budget_usd,
+    },
+    task: {
+      id: context.task.id,
+      title: context.task.title,
+      user_prompt: context.task.user_prompt,
+      goal_type: context.task.goal_type,
+    },
+    routing_tier: context.task.routing_tier ?? "strong",
+    model_profile:
+      context.task.routing_tier === "cheap"
+        ? {
+            provider: context.policy.cheap_provider,
+            model: context.policy.cheap_model,
+          }
+        : {
+            provider: context.policy.strong_provider,
+            model: context.policy.strong_model,
+          },
+  };
 }
 
 function isImmediateChild(parentRoot: string, childRoot: string) {

@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
+    "dev": "node --experimental-strip-types src/main.ts",
+    "start": "node --experimental-strip-types src/main.ts",
     "test": "vp test"
   },
   "dependencies": {

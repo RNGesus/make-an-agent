@@ -6,6 +6,7 @@ import { deliveryMilestones } from "shared";
 import { decideTaskRoute } from "task-router";
 import { defaultServerConfig } from "./config.ts";
 import { createServerApp } from "./app.ts";
+import { startHttpServer } from "./http.ts";
 import { approvalsModule } from "./modules/approvals.ts";
 import { repositoriesModule } from "./modules/repositories.ts";
 import { tasksModule } from "./modules/tasks.ts";
@@ -27,3 +28,4 @@ export const serverScaffold = {
 };
 
 export { createServerApp };
+export { startHttpServer };

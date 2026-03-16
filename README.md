@@ -17,11 +17,14 @@ Monorepo scaffold for a web-first control plane around `pi-coding-agent`.
 
 ```bash
 vp install
-vp run dev
+vp run server#dev
+vp run web#dev
 vp check
 vp run test -r
 vp run build -r
 ```
+
+The server now exposes a real HTTP entrypoint on `http://127.0.0.1:4310` by default, serves the built web app from `apps/web/dist`, and stores Milestone 3 execution artifacts for read-only tasks.
 
 ## Schema
 

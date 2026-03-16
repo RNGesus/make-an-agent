@@ -2,7 +2,15 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import type { RepositoryPolicyRecord, RepositoryRecord, TaskGoalType, TaskRecord } from "shared";
+import type {
+  ArtifactType,
+  AuditEventRecord,
+  RepositoryPolicyRecord,
+  RepositoryRecord,
+  TaskArtifactRecord,
+  TaskGoalType,
+  TaskRecord,
+} from "shared";
 import { connectionPragmas } from "./index.ts";
 
 const initialSchemaSql = readFileSync(
@@ -72,6 +80,25 @@ interface TaskRepositoryRow {
   repository_default_branch: string;
 }
 
+interface TaskArtifactRow {
+  id: string;
+  task_id: string;
+  artifact_type: ArtifactType;
+  summary: string;
+  payload_json: string;
+  created_at: string;
+}
+
+interface AuditEventRow {
+  id: string;
+  repo_id: string | null;
+  task_id: string | null;
+  event_type: string;
+  message: string;
+  details_json: string;
+  created_at: string;
+}
+
 export type RepositoryPolicyValues = Omit<RepositoryPolicyRecord, "repo_id">;
 
 export interface RepositoryRegistrationInput {
@@ -109,6 +136,31 @@ export interface TaskValues {
 export interface TaskSummary {
   task: TaskRecord;
   repository: Pick<RepositoryRecord, "id" | "name" | "default_branch">;
+}
+
+export interface TaskDetail extends TaskSummary {
+  artifacts: TaskArtifactRecord[];
+  audit_events: AuditEventRecord[];
+}
+
+export interface TaskExecutionContext {
+  task: TaskRecord;
+  repository: RepositoryRecord;
+  policy: RepositoryPolicyRecord;
+}
+
+export interface TaskArtifactValues {
+  artifact_type: ArtifactType;
+  summary: string;
+  payload_json: string;
+}
+
+export interface TaskExecutionValues {
+  status: TaskRecord["status"];
+  pi_session_id: string | null;
+  branch_name: string | null;
+  started_at: string | null;
+  completed_at: string | null;
 }
 
 export interface DatabaseBootstrapOptions {
@@ -435,7 +487,33 @@ export function getTaskDetail(database: DatabaseSync, taskId: string) {
     )
     .get({ taskId }) as unknown as (TaskRow & TaskRepositoryRow) | undefined;
 
-  return row ? mapTaskSummaryRow(row) : null;
+  return row
+    ? {
+        ...mapTaskSummaryRow(row),
+        artifacts: listTaskArtifacts(database, taskId),
+        audit_events: listTaskAuditEvents(database, taskId),
+      }
+    : null;
+}
+
+export function getTaskExecutionContext(database: DatabaseSync, taskId: string) {
+  const task = getTaskRecord(database, taskId);
+
+  if (!task) {
+    return null;
+  }
+
+  const repositoryDetail = getRepositoryDetail(database, task.repo_id);
+
+  if (!repositoryDetail) {
+    return null;
+  }
+
+  return {
+    task,
+    repository: repositoryDetail.repository,
+    policy: repositoryDetail.policy,
+  } satisfies TaskExecutionContext;
 }
 
 export function createTask(database: DatabaseSync, values: TaskValues) {
@@ -521,6 +599,88 @@ export function createTask(database: DatabaseSync, values: TaskValues) {
   }
 
   return detail;
+}
+
+export function updateTaskExecution(
+  database: DatabaseSync,
+  taskId: string,
+  values: TaskExecutionValues,
+) {
+  const existing = getTaskRecord(database, taskId);
+
+  if (!existing) {
+    return null;
+  }
+
+  database
+    .prepare(
+      `UPDATE tasks
+       SET status = :status,
+           pi_session_id = :pi_session_id,
+           branch_name = :branch_name,
+           started_at = :started_at,
+           completed_at = :completed_at
+       WHERE id = :id`,
+    )
+    .run({
+      id: taskId,
+      status: values.status,
+      pi_session_id: values.pi_session_id,
+      branch_name: values.branch_name,
+      started_at: values.started_at,
+      completed_at: values.completed_at,
+    });
+
+  return getTaskRecord(database, taskId);
+}
+
+export function replaceTaskArtifacts(
+  database: DatabaseSync,
+  taskId: string,
+  artifacts: readonly TaskArtifactValues[],
+) {
+  database.prepare("DELETE FROM task_artifacts WHERE task_id = :taskId").run({ taskId });
+
+  if (artifacts.length === 0) {
+    return;
+  }
+
+  const insert = database.prepare(
+    `INSERT INTO task_artifacts (
+      id,
+      task_id,
+      artifact_type,
+      summary,
+      payload_json
+    ) VALUES (
+      :id,
+      :task_id,
+      :artifact_type,
+      :summary,
+      :payload_json
+    )`,
+  );
+
+  for (const artifact of artifacts) {
+    insert.run({
+      id: randomUUID(),
+      task_id: taskId,
+      artifact_type: artifact.artifact_type,
+      summary: artifact.summary,
+      payload_json: artifact.payload_json,
+    });
+  }
+}
+
+export function recordAuditEvent(
+  database: DatabaseSync,
+  repoId: string | null,
+  taskId: string | null,
+  eventType: string,
+  message: string,
+  details: Record<string, unknown>,
+) {
+  insertAuditEvent(database, repoId, taskId, eventType, message, details);
 }
 
 function saveRepositoryPolicy(
@@ -622,6 +782,33 @@ function saveRepositoryPolicy(
     });
 }
 
+function getTaskRecord(database: DatabaseSync, taskId: string) {
+  const row = database
+    .prepare(
+      `SELECT
+        id,
+        repo_id,
+        title,
+        user_prompt,
+        goal_type,
+        status,
+        routing_tier,
+        routing_reason,
+        classifier_score,
+        classifier_confidence,
+        pi_session_id,
+        branch_name,
+        started_at,
+        completed_at,
+        created_at
+      FROM tasks
+      WHERE id = :taskId`,
+    )
+    .get({ taskId }) as unknown as TaskRow | undefined;
+
+  return row ? mapTaskRow(row) : null;
+}
+
 function insertAuditEvent(
   database: DatabaseSync,
   repoId: string | null,
@@ -656,6 +843,45 @@ function insertAuditEvent(
       message,
       details_json: JSON.stringify(details),
     });
+}
+
+function listTaskArtifacts(database: DatabaseSync, taskId: string) {
+  const rows = database
+    .prepare(
+      `SELECT
+        id,
+        task_id,
+        artifact_type,
+        summary,
+        payload_json,
+        created_at
+      FROM task_artifacts
+      WHERE task_id = :taskId
+      ORDER BY created_at ASC, id ASC`,
+    )
+    .all({ taskId }) as unknown as TaskArtifactRow[];
+
+  return rows.map(mapTaskArtifactRow);
+}
+
+function listTaskAuditEvents(database: DatabaseSync, taskId: string) {
+  const rows = database
+    .prepare(
+      `SELECT
+        id,
+        repo_id,
+        task_id,
+        event_type,
+        message,
+        details_json,
+        created_at
+      FROM audit_events
+      WHERE task_id = :taskId
+      ORDER BY created_at ASC, id ASC`,
+    )
+    .all({ taskId }) as unknown as AuditEventRow[];
+
+  return rows.map(mapAuditEventRow);
 }
 
 function mapRepositoryDetailRow(row: RepositoryRow & RepositoryPolicyRow): RepositoryDetail {
@@ -734,6 +960,29 @@ function mapTaskRow(row: TaskRow): TaskRecord {
     branch_name: row.branch_name,
     started_at: row.started_at,
     completed_at: row.completed_at,
+    created_at: row.created_at,
+  };
+}
+
+function mapTaskArtifactRow(row: TaskArtifactRow): TaskArtifactRecord {
+  return {
+    id: row.id,
+    task_id: row.task_id,
+    artifact_type: row.artifact_type,
+    summary: row.summary,
+    payload_json: row.payload_json,
+    created_at: row.created_at,
+  };
+}
+
+function mapAuditEventRow(row: AuditEventRow): AuditEventRecord {
+  return {
+    id: row.id,
+    repo_id: row.repo_id,
+    task_id: row.task_id,
+    event_type: row.event_type,
+    message: row.message,
+    details_json: row.details_json,
     created_at: row.created_at,
   };
 }

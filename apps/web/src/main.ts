@@ -19,6 +19,30 @@ type TaskSummary = {
   repository: Pick<RepositoryRecord, "id" | "name" | "default_branch">;
 };
 
+type TaskArtifact = {
+  id: string;
+  task_id: string;
+  artifact_type: string;
+  summary: string;
+  payload_json: string;
+  created_at: string;
+};
+
+type AuditEvent = {
+  id: string;
+  repo_id: string | null;
+  task_id: string | null;
+  event_type: string;
+  message: string;
+  details_json: string;
+  created_at: string;
+};
+
+type TaskDetail = TaskSummary & {
+  artifacts: TaskArtifact[];
+  audit_events: AuditEvent[];
+};
+
 type RepositoryScanCandidate = {
   name: string;
   root_path: string;
@@ -38,7 +62,7 @@ type AppState = {
   scanCandidates: RepositoryScanCandidate[];
   tasks: TaskSummary[];
   selectedTaskId: string | null;
-  selectedTask: TaskSummary | null;
+  selectedTask: TaskDetail | null;
   loading: boolean;
   working: string | null;
   notice: string | null;
@@ -140,7 +164,7 @@ async function refreshTasks() {
     return;
   }
 
-  state.selectedTask = await apiRequest<TaskSummary>(
+  state.selectedTask = await apiRequest<TaskDetail>(
     `/api/tasks/${encodeURIComponent(state.selectedTaskId)}`,
   );
 }
@@ -167,7 +191,7 @@ async function selectTask(taskId: string) {
   render();
 
   try {
-    state.selectedTask = await apiRequest<TaskSummary>(`/api/tasks/${encodeURIComponent(taskId)}`);
+    state.selectedTask = await apiRequest<TaskDetail>(`/api/tasks/${encodeURIComponent(taskId)}`);
   } catch (error) {
     setError(toErrorMessage(error));
   } finally {
@@ -256,13 +280,26 @@ async function createTaskFromForm(form: HTMLFormElement) {
   };
 
   await runAction("Creating task...", async () => {
-    const detail = await apiRequest<TaskSummary>("/api/tasks", {
+    const detail = await apiRequest<TaskDetail>("/api/tasks", {
       method: "POST",
       body: JSON.stringify(payload),
     });
 
     form.reset();
     state.notice = `Created task ${detail.task.title}.`;
+    await refreshTasks();
+    state.selectedTaskId = detail.task.id;
+    state.selectedTask = detail;
+  });
+}
+
+async function retryTask(taskId: string) {
+  await runAction("Running task...", async () => {
+    const detail = await apiRequest<TaskDetail>(`/api/tasks/${encodeURIComponent(taskId)}/retry`, {
+      method: "POST",
+    });
+
+    state.notice = `Updated task ${detail.task.title}.`;
     await refreshTasks();
     state.selectedTaskId = detail.task.id;
     state.selectedTask = detail;
@@ -298,8 +335,9 @@ function render() {
           <p class="eyebrow">Pi Remote Control App</p>
           <h1>Repo intake, policy controls, and task routing now share one operator surface.</h1>
           <p class="lede">
-            This slice follows the approved plan: scan existing workspaces, register repos, tune per-repo
-            autonomy, then create tasks that persist routing decisions for the cheap and strong model tiers.
+            This slice follows the approved plan through Milestone 3: scan existing workspaces, register repos,
+            tune per-repo autonomy, route new tasks, then persist read-only execution sessions and compact
+            artifacts for review.
           </p>
         </div>
 
@@ -310,7 +348,7 @@ function render() {
           </div>
           <div>
             <p class="eyebrow">Milestone focus</p>
-            <strong>M1 + M2</strong>
+            <strong>M1 - M3</strong>
           </div>
           <div>
             <p class="eyebrow">Live state</p>
@@ -391,9 +429,10 @@ function render() {
             <article class="panel detail-panel">
               <div class="section-head compact-head">
                 <div>
-                  <p class="eyebrow">Routing Detail</p>
+                  <p class="eyebrow">Execution Detail</p>
                   <h2>${state.selectedTask ? escapeHtml(state.selectedTask.task.title) : "Select a task"}</h2>
                 </div>
+                ${renderTaskAction(state.selectedTask)}
               </div>
               ${renderTaskDetail()}
             </article>
@@ -619,18 +658,31 @@ function renderTaskList() {
     .join("");
 }
 
-function renderTaskDetail() {
-  if (!state.selectedTask) {
-    return `<p class="empty-state">Select a task to inspect the stored routing decision.</p>`;
+function renderTaskAction(taskDetail: TaskDetail | null) {
+  if (!taskDetail || taskDetail.task.status === "running") {
+    return "";
   }
 
-  const { task, repository } = state.selectedTask;
+  return `<button class="ghost-button" type="button" data-task-retry="${escapeHtml(taskDetail.task.id)}">Run task</button>`;
+}
+
+function renderTaskDetail() {
+  if (!state.selectedTask) {
+    return `<p class="empty-state">Select a task to inspect the stored session, artifacts, and routing record.</p>`;
+  }
+
+  const { task, repository, artifacts, audit_events: auditEvents } = state.selectedTask;
   const classifierConfidence =
     task.classifier_confidence === null
       ? "Not used"
       : `${Math.round(task.classifier_confidence * 100)}%`;
   const classifierScore =
     task.classifier_score === null ? "Not used" : task.classifier_score.toFixed(2);
+  const finalAnswer = readArtifactText(artifacts, "final_answer");
+  const changedFiles = readChangedFiles(artifacts);
+  const diffSummary = readArtifactValue<{ stat?: string }>(artifacts, "diff_summary")?.stat ?? null;
+  const executionNotes =
+    readArtifactValue<{ notes?: string[] }>(artifacts, "execution_notes")?.notes ?? [];
 
   return `
     <div class="detail-stack">
@@ -656,13 +708,85 @@ function renderTaskDetail() {
           <dt>Classifier confidence</dt>
           <dd>${escapeHtml(classifierConfidence)}</dd>
         </div>
+        <div>
+          <dt>Pi session</dt>
+          <dd>${escapeHtml(task.pi_session_id ?? "Pending")}</dd>
+        </div>
+        <div>
+          <dt>Completed at</dt>
+          <dd>${escapeHtml(task.completed_at ?? "Pending")}</dd>
+        </div>
       </dl>
       <div class="routing-callout">
         <p class="eyebrow">Routing reason</p>
         <p>${escapeHtml(task.routing_reason ?? "Routing has not been computed yet.")}</p>
       </div>
+      <div class="detail-section">
+        <p class="eyebrow">Final answer</p>
+        <div class="detail-card">
+          <p>${escapeHtml(finalAnswer ?? "Execution has not produced a final answer yet.")}</p>
+        </div>
+      </div>
+      <div class="detail-section">
+        <p class="eyebrow">Workspace artifacts</p>
+        <div class="detail-card detail-card-stack">
+          <p>${escapeHtml(diffSummary ?? "No diff summary is stored for this task yet.")}</p>
+          ${renderChangedFiles(changedFiles)}
+          ${renderNotes(executionNotes)}
+        </div>
+      </div>
+      <div class="detail-section">
+        <p class="eyebrow">Audit trail</p>
+        <div class="detail-card detail-card-stack">
+          ${renderAuditEvents(auditEvents)}
+        </div>
+      </div>
     </div>
   `;
+}
+
+function renderChangedFiles(files: Array<{ path: string; status: string }>) {
+  if (files.length === 0) {
+    return `<p class="empty-state">No changed files were captured for the allowed workspace root.</p>`;
+  }
+
+  return `<div class="artifact-list">${files
+    .map(
+      (file) => `
+        <div class="artifact-row">
+          <code>${escapeHtml(file.path)}</code>
+          <span class="chip chip-soft">${escapeHtml(file.status)}</span>
+        </div>
+      `,
+    )
+    .join("")}</div>`;
+}
+
+function renderNotes(notes: string[]) {
+  if (notes.length === 0) {
+    return "";
+  }
+
+  return `<div class="artifact-list">${notes
+    .map((note) => `<p class="artifact-note">${escapeHtml(note)}</p>`)
+    .join("")}</div>`;
+}
+
+function renderAuditEvents(auditEvents: AuditEvent[]) {
+  if (auditEvents.length === 0) {
+    return `<p class="empty-state">No audit events were recorded for this task yet.</p>`;
+  }
+
+  return `<div class="artifact-list">${auditEvents
+    .map(
+      (event) => `
+        <div class="artifact-row artifact-row-stack">
+          <strong>${escapeHtml(event.message)}</strong>
+          <small>${escapeHtml(event.event_type)} · ${escapeHtml(event.created_at)}</small>
+        </div>
+      `,
+    )
+    .join("")}</div>`;
 }
 
 function bindEvents() {
@@ -702,6 +826,16 @@ function bindEvents() {
 
       if (taskId) {
         void selectTask(taskId);
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task-retry]")) {
+    button.addEventListener("click", () => {
+      const taskId = button.dataset.taskRetry;
+
+      if (taskId) {
+        void retryTask(taskId);
       }
     });
   }
@@ -769,6 +903,35 @@ async function apiRequest<T>(path: string, init: RequestInit = {}) {
 
 function resolveApiUrl(path: string) {
   return new URL(path, state.apiBaseUrl || window.location.origin).toString();
+}
+
+function readArtifactText(artifacts: TaskArtifact[], artifactType: string) {
+  const payload = readArtifactValue<{ text?: string }>(artifacts, artifactType);
+
+  return payload?.text ?? null;
+}
+
+function readChangedFiles(artifacts: TaskArtifact[]) {
+  const payload = readArtifactValue<{ files?: Array<{ path: string; status: string }> }>(
+    artifacts,
+    "changed_files",
+  );
+
+  return payload?.files ?? [];
+}
+
+function readArtifactValue<T>(artifacts: TaskArtifact[], artifactType: string) {
+  const artifact = artifacts.find((entry) => entry.artifact_type === artifactType);
+
+  if (!artifact) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(artifact.payload_json) as T;
+  } catch {
+    return null;
+  }
 }
 
 function requireStringValue(formData: FormData, key: string) {

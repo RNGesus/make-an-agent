@@ -117,6 +117,84 @@ test("ambiguous tasks persist classifier metadata when routing escalates", async
   expect(created.task.classifier_confidence).toBeLessThan(0.65);
 });
 
+test("read-only tasks auto-execute and persist session artifacts", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-gamma");
+  const app = createApp(workspaceRoot);
+  const repoId = await registerRepository(app, repoRoot);
+
+  const createResponse = await app.handleRequest(
+    new Request("http://localhost/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repo_id: repoId,
+        title: "Summarize the repository",
+        user_prompt: "Explain what this repository contains and how to start reading it",
+        goal_type: "question",
+      }),
+    }),
+  );
+  const created = (await createResponse.json()) as {
+    task: { status: string; pi_session_id: string | null };
+    artifacts: Array<{ artifact_type: string; summary: string; payload_json: string }>;
+    audit_events: Array<{ event_type: string }>;
+  };
+
+  expect(createResponse.status).toBe(201);
+  expect(created.task.status).toBe("completed");
+  expect(created.task.pi_session_id).toContain("pi-rpc:");
+  expect(created.artifacts).toHaveLength(4);
+  expect(created.artifacts.map((artifact) => artifact.artifact_type).sort()).toEqual([
+    "changed_files",
+    "diff_summary",
+    "execution_notes",
+    "final_answer",
+  ]);
+  expect(
+    created.artifacts.find((artifact) => artifact.artifact_type === "final_answer")?.summary,
+  ).toContain("Mock RPC pi session");
+  expect(created.audit_events.map((event) => event.event_type)).toContain(
+    "task.execution.completed",
+  );
+});
+
+test("read-only execution does not attribute pre-existing dirty changes to the task", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-delta");
+  const app = createApp(workspaceRoot);
+  const repoId = await registerRepository(app, repoRoot);
+
+  writeFileSync(join(repoRoot, "README.md"), "# tasks-delta\nDirty before execution\n");
+
+  const createResponse = await app.handleRequest(
+    new Request("http://localhost/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repo_id: repoId,
+        user_prompt: "Explain the repository layout",
+        goal_type: "question",
+      }),
+    }),
+  );
+  const created = (await createResponse.json()) as {
+    artifacts: Array<{ artifact_type: string; summary: string; payload_json: string }>;
+  };
+  const changedFiles = JSON.parse(
+    created.artifacts.find((artifact) => artifact.artifact_type === "changed_files")
+      ?.payload_json ?? "{}",
+  ) as {
+    files?: Array<{ path: string; status: string }>;
+  };
+
+  expect(createResponse.status).toBe(201);
+  expect(changedFiles.files ?? []).toEqual([]);
+  expect(
+    created.artifacts.find((artifact) => artifact.artifact_type === "diff_summary")?.summary,
+  ).toContain("already dirty before execution");
+});
+
 test("task creation rejects unknown repositories", async () => {
   const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
   const app = createApp(workspaceRoot);
