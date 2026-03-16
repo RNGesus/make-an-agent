@@ -1,5 +1,5 @@
 import { expect, test } from "vite-plus/test";
-import { decideTaskRoute } from "../src/index.ts";
+import { decideTaskRoute, resolveTaskRoute } from "../src/index.ts";
 
 test("routes read-only questions to the cheap tier", () => {
   const decision = decideTaskRoute({
@@ -28,4 +28,25 @@ test("marks ambiguous prompts for classifier follow-up", () => {
 
   expect(decision.tier).toBe("cheap");
   expect(decision.requires_classifier).toBe(true);
+});
+
+test("keeps classifier-backed change work on the strong tier", () => {
+  const decision = resolveTaskRoute({
+    prompt: "Wire the task form to the API and save routing decisions",
+  });
+
+  expect(decision.tier).toBe("strong");
+  expect(decision.classifier_score).not.toBeNull();
+  expect(decision.classifier_confidence).not.toBeNull();
+  expect(decision.reason).toContain("Confidence");
+});
+
+test("escalates low-confidence ambiguous work to the strong tier", () => {
+  const decision = resolveTaskRoute({
+    prompt: "Take a look at the repo and tell me where to start",
+  });
+
+  expect(decision.tier).toBe("strong");
+  expect(decision.classifier_confidence).toBeLessThan(0.65);
+  expect(decision.reason).toContain("escalated");
 });

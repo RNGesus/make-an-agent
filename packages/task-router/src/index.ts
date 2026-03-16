@@ -13,6 +13,19 @@ export interface RoutingDecision {
   requires_classifier: boolean;
 }
 
+export interface ClassifierDecision {
+  category: "analysis" | "change" | "planning";
+  score: number;
+  confidence: number;
+  recommended_tier: RoutingTier;
+  reason: string;
+}
+
+export interface ResolvedRoutingDecision extends RoutingDecision {
+  classifier_score: number | null;
+  classifier_confidence: number | null;
+}
+
 const cheapGoalTypes = new Set<TaskGoalType>(["question"]);
 const strongGoalTypes = new Set<TaskGoalType>(["plan", "implement", "fix", "refactor", "debug"]);
 const cheapKeywords = ["explain", "summarize", "read-only", "what does", "show me"];
@@ -76,5 +89,103 @@ export function decideTaskRoute(input: TaskRoutingInput): RoutingDecision {
     reason:
       "Prompt is ambiguous, so a cheap classifier should run before escalating if confidence is low.",
     requires_classifier: true,
+  };
+}
+
+export function classifyAmbiguousTask(input: TaskRoutingInput): ClassifierDecision {
+  const haystack = `${input.title ?? ""} ${input.prompt}`.toLowerCase();
+  const actionHints = [
+    "add",
+    "change",
+    "create",
+    "save",
+    "wire",
+    "update",
+    "persist",
+    "endpoint",
+    "form",
+    "page",
+  ];
+  const analysisHints = ["read", "review", "summarize", "inventory", "document", "describe"];
+  const planningHints = ["where to start", "next step", "approach", "strategy", "should we"];
+
+  if (actionHints.some((hint) => haystack.includes(hint))) {
+    return {
+      category: "change",
+      score: 0.84,
+      confidence: 0.82,
+      recommended_tier: "strong",
+      reason: "Classifier sees likely product or code changes.",
+    };
+  }
+
+  if (analysisHints.some((hint) => haystack.includes(hint))) {
+    return {
+      category: "analysis",
+      score: 0.18,
+      confidence: 0.79,
+      recommended_tier: "cheap",
+      reason: "Classifier sees repo analysis or explanation work.",
+    };
+  }
+
+  if (planningHints.some((hint) => haystack.includes(hint))) {
+    return {
+      category: "planning",
+      score: 0.61,
+      confidence: 0.58,
+      recommended_tier: "strong",
+      reason: "Classifier sees planning work but with limited confidence.",
+    };
+  }
+
+  if ((input.expected_file_count ?? 0) > 1) {
+    return {
+      category: "change",
+      score: 0.72,
+      confidence: 0.68,
+      recommended_tier: "strong",
+      reason: "Classifier expects the task to span more than one file.",
+    };
+  }
+
+  return {
+    category: "analysis",
+    score: 0.42,
+    confidence: 0.46,
+    recommended_tier: "cheap",
+    reason: "Classifier could not confidently separate analysis from change work.",
+  };
+}
+
+export function resolveTaskRoute(input: TaskRoutingInput): ResolvedRoutingDecision {
+  const decision = decideTaskRoute(input);
+
+  if (!decision.requires_classifier) {
+    return {
+      ...decision,
+      classifier_score: null,
+      classifier_confidence: null,
+    };
+  }
+
+  const classifier = classifyAmbiguousTask(input);
+
+  if (classifier.confidence < 0.65) {
+    return {
+      tier: "strong",
+      reason: `Cheap classifier confidence was ${(classifier.confidence * 100).toFixed(0)}%, so the task escalated to the strong tier.`,
+      requires_classifier: true,
+      classifier_score: classifier.score,
+      classifier_confidence: classifier.confidence,
+    };
+  }
+
+  return {
+    tier: classifier.recommended_tier,
+    reason: `${classifier.reason} Confidence ${(classifier.confidence * 100).toFixed(0)}% kept the task on the ${classifier.recommended_tier} tier.`,
+    requires_classifier: true,
+    classifier_score: classifier.score,
+    classifier_confidence: classifier.confidence,
   };
 }

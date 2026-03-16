@@ -3,14 +3,18 @@ import { dirname, resolve as resolvePath, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   bootstrapControlPlaneDatabase,
+  createTask,
+  getTaskDetail,
   getRepositoryDetail,
   getRepositoryByRootPath,
+  listTasks,
   listRepositories,
   registerRepository,
   type RepositoryPolicyValues,
   updateRepositoryPolicy,
 } from "db/runtime";
-import { autonomyModes, type AutonomyMode } from "shared";
+import { autonomyModes, taskGoalTypes, type AutonomyMode, type TaskGoalType } from "shared";
+import { resolveTaskRoute } from "task-router";
 import type { ServerConfig } from "./config.ts";
 import { defaultServerConfig } from "./config.ts";
 
@@ -67,6 +71,14 @@ type RegisterRepositoryBody = {
   policy?: PolicyPatch;
 };
 
+type CreateTaskBody = {
+  repo_id: string;
+  title?: string;
+  user_prompt: string;
+  goal_type?: string;
+  expected_file_count?: number;
+};
+
 export function createServerApp(overrides: Partial<ServerConfig> = {}): ServerApp {
   const config: ServerConfig = {
     ...defaultServerConfig,
@@ -92,13 +104,19 @@ async function routeRequest(
 ) {
   const url = new URL(request.url);
 
+  if (request.method === "OPTIONS") {
+    return isAllowedOrigin(request, config)
+      ? new Response(null, { status: 204, headers: corsHeaders(request, config) })
+      : new Response(null, { status: 403 });
+  }
+
   if (request.method === "GET" && url.pathname === "/api/repos") {
-    return jsonResponse(200, { repositories: listRepositories(database) });
+    return jsonResponse(request, config, 200, { repositories: listRepositories(database) });
   }
 
   if (request.method === "POST" && url.pathname === "/api/repos/scan") {
     const candidates = scanWorkspaceParent(config.workspace_parent_dir, database);
-    return jsonResponse(200, {
+    return jsonResponse(request, config, 200, {
       parent_dir: config.workspace_parent_dir,
       candidates,
     });
@@ -108,7 +126,7 @@ async function routeRequest(
     const body = await readJsonBody(request);
 
     if (!isRegisterRepositoryBody(body)) {
-      return jsonResponse(400, {
+      return jsonResponse(request, config, 400, {
         error: "Repository registration requests must include a string root_path.",
       });
     }
@@ -140,9 +158,9 @@ async function routeRequest(
         policy: buildRepositoryPolicy(allowedRoot, config.default_autonomy_mode, policyPatch),
       });
 
-      return jsonResponse(existing ? 200 : 201, detail);
+      return jsonResponse(request, config, existing ? 200 : 201, detail);
     } catch (error) {
-      return jsonResponse(400, {
+      return jsonResponse(request, config, 400, {
         error: error instanceof Error ? error.message : "Could not register repository.",
       });
     }
@@ -154,8 +172,10 @@ async function routeRequest(
     const detail = getRepositoryDetail(database, detailMatch.repoId);
 
     return detail
-      ? jsonResponse(200, detail)
-      : jsonResponse(404, { error: `Repository '${detailMatch.repoId}' was not found.` });
+      ? jsonResponse(request, config, 200, detail)
+      : jsonResponse(request, config, 404, {
+          error: `Repository '${detailMatch.repoId}' was not found.`,
+        });
   }
 
   const policyMatch = matchRepositoryPolicy(url.pathname);
@@ -164,7 +184,7 @@ async function routeRequest(
     const body = await readJsonBody(request);
 
     if (!isObject(body)) {
-      return jsonResponse(400, {
+      return jsonResponse(request, config, 400, {
         error: "Repository policy updates must be a JSON object.",
       });
     }
@@ -173,7 +193,9 @@ async function routeRequest(
       const existingDetail = getRepositoryDetail(database, policyMatch.repoId);
 
       if (!existingDetail) {
-        return jsonResponse(404, { error: `Repository '${policyMatch.repoId}' was not found.` });
+        return jsonResponse(request, config, 404, {
+          error: `Repository '${policyMatch.repoId}' was not found.`,
+        });
       }
 
       const patch = normalizePolicyPatch(body);
@@ -188,16 +210,107 @@ async function routeRequest(
       const detail = updateRepositoryPolicy(database, policyMatch.repoId, patch);
 
       return detail
-        ? jsonResponse(200, detail)
-        : jsonResponse(404, { error: `Repository '${policyMatch.repoId}' was not found.` });
+        ? jsonResponse(request, config, 200, detail)
+        : jsonResponse(request, config, 404, {
+            error: `Repository '${policyMatch.repoId}' was not found.`,
+          });
     } catch (error) {
-      return jsonResponse(400, {
+      return jsonResponse(request, config, 400, {
         error: error instanceof Error ? error.message : "Could not update repository policy.",
       });
     }
   }
 
-  return jsonResponse(404, { error: `No route matches ${request.method} ${url.pathname}.` });
+  if (request.method === "GET" && url.pathname === "/api/tasks") {
+    const repoId = url.searchParams.get("repo_id") ?? undefined;
+    return jsonResponse(request, config, 200, { tasks: listTasks(database, repoId) });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/tasks") {
+    const body = await readJsonBody(request);
+
+    if (!isCreateTaskBody(body)) {
+      return jsonResponse(request, config, 400, {
+        error: "Task creation requests must include string repo_id and user_prompt fields.",
+      });
+    }
+
+    const repoDetail = getRepositoryDetail(database, body.repo_id);
+
+    if (!repoDetail) {
+      return jsonResponse(request, config, 404, {
+        error: `Repository '${body.repo_id}' was not found.`,
+      });
+    }
+
+    if (!repoDetail.repository.is_active) {
+      return jsonResponse(request, config, 400, {
+        error: `Repository '${body.repo_id}' is inactive and cannot accept tasks.`,
+      });
+    }
+
+    if (body.user_prompt.trim().length === 0) {
+      return jsonResponse(request, config, 400, {
+        error: "Task user_prompt must not be empty.",
+      });
+    }
+
+    if (
+      body.expected_file_count !== undefined &&
+      (!Number.isInteger(body.expected_file_count) || body.expected_file_count < 0)
+    ) {
+      return jsonResponse(request, config, 400, {
+        error: "expected_file_count must be a non-negative integer when provided.",
+      });
+    }
+
+    try {
+      const routingGoalType = resolveTaskGoalType(body.goal_type, body.user_prompt, body.title);
+      const routing = resolveTaskRoute({
+        title: body.title,
+        prompt: body.user_prompt,
+        goal_type: routingGoalType,
+        expected_file_count: body.expected_file_count,
+      });
+      const task = createTask(database, {
+        repo_id: repoDetail.repository.id,
+        title: normalizeTaskTitle(body.title, body.user_prompt),
+        user_prompt: body.user_prompt.trim(),
+        goal_type: routingGoalType ?? "question",
+        status: "queued",
+        routing_tier: routing.tier,
+        routing_reason: routing.reason,
+        classifier_score: routing.classifier_score,
+        classifier_confidence: routing.classifier_confidence,
+        pi_session_id: null,
+        branch_name: null,
+        started_at: null,
+        completed_at: null,
+      });
+
+      return jsonResponse(request, config, 201, task);
+    } catch (error) {
+      return jsonResponse(request, config, 400, {
+        error: error instanceof Error ? error.message : "Could not create task.",
+      });
+    }
+  }
+
+  const taskDetailMatch = matchTaskDetail(url.pathname);
+
+  if (request.method === "GET" && taskDetailMatch) {
+    const detail = getTaskDetail(database, taskDetailMatch.taskId);
+
+    return detail
+      ? jsonResponse(request, config, 200, detail)
+      : jsonResponse(request, config, 404, {
+          error: `Task '${taskDetailMatch.taskId}' was not found.`,
+        });
+  }
+
+  return jsonResponse(request, config, 404, {
+    error: `No route matches ${request.method} ${url.pathname}.`,
+  });
 }
 
 function scanWorkspaceParent(
@@ -368,6 +481,12 @@ function matchRepositoryPolicy(pathname: string) {
   return match ? { repoId: decodeURIComponent(match[1] ?? "") } : null;
 }
 
+function matchTaskDetail(pathname: string) {
+  const match = /^\/api\/tasks\/([^/]+)$/.exec(pathname);
+
+  return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
+}
+
 async function readJsonBody(request: Request) {
   try {
     return (await request.json()) as unknown;
@@ -376,17 +495,55 @@ async function readJsonBody(request: Request) {
   }
 }
 
-function jsonResponse(status: number, body: unknown) {
+function jsonResponse(request: Request, config: ServerConfig, status: number, body: unknown) {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
+      ...corsHeaders(request, config),
     },
   });
 }
 
+function corsHeaders(request: Request, config: ServerConfig) {
+  if (!isAllowedOrigin(request, config)) {
+    return {};
+  }
+
+  const origin = request.headers.get("origin");
+
+  return {
+    "access-control-allow-origin": origin ?? new URL(request.url).origin,
+    "access-control-allow-methods": "GET,POST,PATCH,OPTIONS",
+    "access-control-allow-headers": "content-type",
+  };
+}
+
+function isAllowedOrigin(request: Request, config: ServerConfig) {
+  const origin = request.headers.get("origin");
+
+  if (!origin) {
+    return true;
+  }
+
+  const sameOrigin = origin === new URL(request.url).origin;
+
+  return sameOrigin || config.allowed_origins.includes(origin);
+}
+
 function isRegisterRepositoryBody(value: unknown): value is RegisterRepositoryBody {
   return isObject(value) && typeof value.root_path === "string";
+}
+
+function isCreateTaskBody(value: unknown): value is CreateTaskBody {
+  return (
+    isObject(value) &&
+    typeof value.repo_id === "string" &&
+    typeof value.user_prompt === "string" &&
+    (value.title === undefined || typeof value.title === "string") &&
+    (value.goal_type === undefined || typeof value.goal_type === "string") &&
+    (value.expected_file_count === undefined || typeof value.expected_file_count === "number")
+  );
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -452,8 +609,16 @@ function normalizePolicyPatch(value: Record<string, unknown>): PolicyPatch {
     }
 
     if ((numberPolicyKeys as readonly string[]).includes(key)) {
-      if (typeof rawValue !== "number" || Number.isNaN(rawValue)) {
+      if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
         throw new Error(`${key} must be a number.`);
+      }
+
+      if (key === "max_escalations" && (!Number.isInteger(rawValue) || rawValue < 0)) {
+        throw new Error("max_escalations must be a non-negative integer.");
+      }
+
+      if (key === "max_task_budget_usd" && rawValue < 0) {
+        throw new Error("max_task_budget_usd must be greater than or equal to 0.");
       }
 
       patch[key as (typeof numberPolicyKeys)[number]] = rawValue;
@@ -464,6 +629,70 @@ function normalizePolicyPatch(value: Record<string, unknown>): PolicyPatch {
   }
 
   return patch;
+}
+
+function resolveTaskGoalType(
+  value: string | undefined,
+  prompt: string,
+  title: string | undefined,
+): TaskGoalType | undefined {
+  if (value) {
+    return toTaskGoalType(value);
+  }
+
+  const haystack = `${title ?? ""} ${prompt}`.toLowerCase();
+
+  if (haystack.includes("refactor")) {
+    return "refactor";
+  }
+
+  if (haystack.includes("debug") || haystack.includes("investigate")) {
+    return "debug";
+  }
+
+  if (haystack.includes("fix") || haystack.includes("bug")) {
+    return "fix";
+  }
+
+  if (haystack.includes("plan") || haystack.includes("approach")) {
+    return "plan";
+  }
+
+  if (
+    haystack.includes("implement") ||
+    haystack.includes("add") ||
+    haystack.includes("create") ||
+    haystack.includes("wire")
+  ) {
+    return "implement";
+  }
+
+  if (
+    haystack.includes("explain") ||
+    haystack.includes("summarize") ||
+    haystack.includes("what does") ||
+    haystack.includes("show me")
+  ) {
+    return "question";
+  }
+
+  return undefined;
+}
+
+function normalizeTaskTitle(title: string | undefined, userPrompt: string) {
+  const trimmedTitle = title?.trim();
+
+  if (trimmedTitle) {
+    return trimmedTitle;
+  }
+
+  const trimmedPrompt = userPrompt.trim();
+
+  if (!trimmedPrompt) {
+    throw new Error("user_prompt must not be empty.");
+  }
+
+  return trimmedPrompt.length <= 72 ? trimmedPrompt : `${trimmedPrompt.slice(0, 69).trimEnd()}...`;
 }
 
 function isImmediateChild(parentRoot: string, childRoot: string) {
@@ -531,4 +760,12 @@ function toAutonomyMode(value: string): AutonomyMode {
   }
 
   throw new Error(`Autonomy mode '${value}' is not supported.`);
+}
+
+function toTaskGoalType(value: string): TaskGoalType {
+  if (taskGoalTypes.includes(value as TaskGoalType)) {
+    return value as TaskGoalType;
+  }
+
+  throw new Error(`Task goal type '${value}' is not supported.`);
 }

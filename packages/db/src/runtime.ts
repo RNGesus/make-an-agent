@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import type { RepositoryPolicyRecord, RepositoryRecord } from "shared";
+import type { RepositoryPolicyRecord, RepositoryRecord, TaskGoalType, TaskRecord } from "shared";
 import { connectionPragmas } from "./index.ts";
 
 const initialSchemaSql = readFileSync(
@@ -48,6 +48,30 @@ interface RepositoryPolicyRow {
   max_task_budget_usd: number;
 }
 
+interface TaskRow {
+  id: string;
+  repo_id: string;
+  title: string;
+  user_prompt: string;
+  goal_type: TaskGoalType;
+  status: TaskRecord["status"];
+  routing_tier: TaskRecord["routing_tier"];
+  routing_reason: string | null;
+  classifier_score: number | null;
+  classifier_confidence: number | null;
+  pi_session_id: string | null;
+  branch_name: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+interface TaskRepositoryRow {
+  repository_id: string;
+  repository_name: string;
+  repository_default_branch: string;
+}
+
 export type RepositoryPolicyValues = Omit<RepositoryPolicyRecord, "repo_id">;
 
 export interface RepositoryRegistrationInput {
@@ -64,6 +88,27 @@ export interface RepositoryRegistrationInput {
 export interface RepositoryDetail {
   repository: RepositoryRecord;
   policy: RepositoryPolicyRecord;
+}
+
+export interface TaskValues {
+  repo_id: string;
+  title: string;
+  user_prompt: string;
+  goal_type: TaskGoalType;
+  status: TaskRecord["status"];
+  routing_tier: TaskRecord["routing_tier"];
+  routing_reason: string | null;
+  classifier_score: number | null;
+  classifier_confidence: number | null;
+  pi_session_id: string | null;
+  branch_name: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface TaskSummary {
+  task: TaskRecord;
+  repository: Pick<RepositoryRecord, "id" | "name" | "default_branch">;
 }
 
 export interface DatabaseBootstrapOptions {
@@ -264,6 +309,7 @@ export function registerRepository(database: DatabaseSync, input: RepositoryRegi
     insertAuditEvent(
       database,
       repoId,
+      null,
       existing ? "repository.updated" : "repository.registered",
       existing
         ? `Updated repository registration for ${input.name}.`
@@ -311,9 +357,16 @@ export function updateRepositoryPolicy(
 
   try {
     saveRepositoryPolicy(database, repoId, nextPolicy);
-    insertAuditEvent(database, repoId, "repository_policy.updated", "Updated repository policy.", {
-      changed_keys: Object.keys(patch).sort(),
-    });
+    insertAuditEvent(
+      database,
+      repoId,
+      null,
+      "repository_policy.updated",
+      "Updated repository policy.",
+      {
+        changed_keys: Object.keys(patch).sort(),
+      },
+    );
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -321,6 +374,153 @@ export function updateRepositoryPolicy(
   }
 
   return getRepositoryDetail(database, repoId);
+}
+
+export function listTasks(database: DatabaseSync, repoId?: string) {
+  const query = `SELECT
+      t.id,
+      t.repo_id,
+      t.title,
+      t.user_prompt,
+      t.goal_type,
+      t.status,
+      t.routing_tier,
+      t.routing_reason,
+      t.classifier_score,
+      t.classifier_confidence,
+      t.pi_session_id,
+      t.branch_name,
+      t.started_at,
+      t.completed_at,
+      t.created_at,
+      r.id AS repository_id,
+      r.name AS repository_name,
+      r.default_branch AS repository_default_branch
+    FROM tasks t
+    INNER JOIN repositories r ON r.id = t.repo_id
+    ${repoId ? "WHERE t.repo_id = :repoId" : ""}
+    ORDER BY t.created_at DESC, t.id DESC`;
+  const rows = database.prepare(query).all(repoId ? { repoId } : {}) as unknown as Array<
+    TaskRow & TaskRepositoryRow
+  >;
+
+  return rows.map(mapTaskSummaryRow);
+}
+
+export function getTaskDetail(database: DatabaseSync, taskId: string) {
+  const row = database
+    .prepare(
+      `SELECT
+        t.id,
+        t.repo_id,
+        t.title,
+        t.user_prompt,
+        t.goal_type,
+        t.status,
+        t.routing_tier,
+        t.routing_reason,
+        t.classifier_score,
+        t.classifier_confidence,
+        t.pi_session_id,
+        t.branch_name,
+        t.started_at,
+        t.completed_at,
+        t.created_at,
+        r.id AS repository_id,
+        r.name AS repository_name,
+        r.default_branch AS repository_default_branch
+      FROM tasks t
+      INNER JOIN repositories r ON r.id = t.repo_id
+      WHERE t.id = :taskId`,
+    )
+    .get({ taskId }) as unknown as (TaskRow & TaskRepositoryRow) | undefined;
+
+  return row ? mapTaskSummaryRow(row) : null;
+}
+
+export function createTask(database: DatabaseSync, values: TaskValues) {
+  const taskId = randomUUID();
+
+  database.exec("BEGIN");
+
+  try {
+    database
+      .prepare(
+        `INSERT INTO tasks (
+          id,
+          repo_id,
+          title,
+          user_prompt,
+          goal_type,
+          status,
+          routing_tier,
+          routing_reason,
+          classifier_score,
+          classifier_confidence,
+          pi_session_id,
+          branch_name,
+          started_at,
+          completed_at
+        ) VALUES (
+          :id,
+          :repo_id,
+          :title,
+          :user_prompt,
+          :goal_type,
+          :status,
+          :routing_tier,
+          :routing_reason,
+          :classifier_score,
+          :classifier_confidence,
+          :pi_session_id,
+          :branch_name,
+          :started_at,
+          :completed_at
+        )`,
+      )
+      .run({
+        id: taskId,
+        repo_id: values.repo_id,
+        title: values.title,
+        user_prompt: values.user_prompt,
+        goal_type: values.goal_type,
+        status: values.status,
+        routing_tier: values.routing_tier,
+        routing_reason: values.routing_reason,
+        classifier_score: values.classifier_score,
+        classifier_confidence: values.classifier_confidence,
+        pi_session_id: values.pi_session_id,
+        branch_name: values.branch_name,
+        started_at: values.started_at,
+        completed_at: values.completed_at,
+      });
+
+    insertAuditEvent(
+      database,
+      values.repo_id,
+      taskId,
+      "task.created",
+      `Created task ${values.title}.`,
+      {
+        goal_type: values.goal_type,
+        routing_tier: values.routing_tier,
+        classifier_confidence: values.classifier_confidence,
+      },
+    );
+
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+
+  const detail = getTaskDetail(database, taskId);
+
+  if (!detail) {
+    throw new Error(`Task '${taskId}' was not available after creation.`);
+  }
+
+  return detail;
 }
 
 function saveRepositoryPolicy(
@@ -424,7 +624,8 @@ function saveRepositoryPolicy(
 
 function insertAuditEvent(
   database: DatabaseSync,
-  repoId: string,
+  repoId: string | null,
+  taskId: string | null,
   eventType: string,
   message: string,
   details: Record<string, unknown>,
@@ -441,7 +642,7 @@ function insertAuditEvent(
       ) VALUES (
         :id,
         :repo_id,
-        NULL,
+        :task_id,
         :event_type,
         :message,
         :details_json
@@ -450,6 +651,7 @@ function insertAuditEvent(
     .run({
       id: randomUUID(),
       repo_id: repoId,
+      task_id: taskId,
       event_type: eventType,
       message,
       details_json: JSON.stringify(details),
@@ -460,6 +662,17 @@ function mapRepositoryDetailRow(row: RepositoryRow & RepositoryPolicyRow): Repos
   return {
     repository: mapRepositoryRow(row),
     policy: mapRepositoryPolicyRow(row),
+  };
+}
+
+function mapTaskSummaryRow(row: TaskRow & TaskRepositoryRow): TaskSummary {
+  return {
+    task: mapTaskRow(row),
+    repository: {
+      id: row.repository_id,
+      name: row.repository_name,
+      default_branch: row.repository_default_branch,
+    },
   };
 }
 
@@ -502,6 +715,26 @@ function mapRepositoryPolicyRow(row: RepositoryPolicyRow): RepositoryPolicyRecor
     classifier_model: row.classifier_model,
     max_escalations: row.max_escalations,
     max_task_budget_usd: row.max_task_budget_usd,
+  };
+}
+
+function mapTaskRow(row: TaskRow): TaskRecord {
+  return {
+    id: row.id,
+    repo_id: row.repo_id,
+    title: row.title,
+    user_prompt: row.user_prompt,
+    goal_type: row.goal_type,
+    status: row.status,
+    routing_tier: row.routing_tier,
+    routing_reason: row.routing_reason,
+    classifier_score: row.classifier_score,
+    classifier_confidence: row.classifier_confidence,
+    pi_session_id: row.pi_session_id,
+    branch_name: row.branch_name,
+    started_at: row.started_at,
+    completed_at: row.completed_at,
+    created_at: row.created_at,
   };
 }
 

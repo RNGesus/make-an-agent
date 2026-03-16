@@ -3,6 +3,7 @@ export interface ServerConfig {
   database_path: string;
   default_autonomy_mode: string;
   queue_mode: "in-process";
+  allowed_origins: string[];
 }
 
 export const defaultServerConfig: ServerConfig = {
@@ -10,4 +11,5 @@ export const defaultServerConfig: ServerConfig = {
   database_path: ".data/pi-remote-control.sqlite",
   default_autonomy_mode: "approve-writes",
   queue_mode: "in-process",
+  allowed_origins: [],
 };
