@@ -4,11 +4,15 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./runtime": "./src/runtime.ts"
   },
   "scripts": {
     "build": "tsc --noEmit",
     "test": "vp test"
+  },
+  "dependencies": {
+    "shared": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",

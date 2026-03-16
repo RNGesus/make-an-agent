@@ -79,6 +79,10 @@ importers:
         version: 0.1.12(@types/node@25.5.0)(@voidzero-dev/vite-plus-core@0.1.12(@types/node@25.5.0)(jiti@2.6.1)(typescript@5.9.3)(yaml@2.8.2))(jiti@2.6.1)(typescript@5.9.3)(yaml@2.8.2)
 
   packages/db:
+    dependencies:
+      shared:
+        specifier: workspace:*
+        version: link:../shared
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
