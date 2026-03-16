@@ -48,3 +48,19 @@ test("blocks commands outside the allowed patterns when marked risky", () => {
 
   expect(decision.allowed).toBe(false);
 });
+
+test("fails closed when a safe command pattern is invalid", () => {
+  const decision = evaluatePolicyAction(
+    {
+      ...basePolicy,
+      safe_command_patterns: ["[invalid"],
+    },
+    {
+      kind: "bash",
+      command: "git status",
+    },
+  );
+
+  expect(decision.allowed).toBe(false);
+  expect(decision.reason).toContain("invalid safe-command pattern");
+});

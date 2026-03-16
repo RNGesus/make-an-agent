@@ -1,4 +1,4 @@
-import { initialMigration, schemaTables } from "db";
+import { connectionPragmas, initialMigration, schemaTables } from "db";
 import { buildPullRequestDraft } from "github";
 import { createPiExecutionEnvelope } from "pi-runner";
 import { evaluatePolicyAction } from "policy-engine";
@@ -13,6 +13,7 @@ export const serverScaffold = {
   app: "pi-remote-control-server",
   config: defaultServerConfig,
   migration: initialMigration,
+  connection_pragmas: connectionPragmas,
   modules: [repositoriesModule, tasksModule, approvalsModule],
   packages: {
     schema_tables: schemaTables.map((table) => table.name),

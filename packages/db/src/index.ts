@@ -93,3 +93,5 @@ export const initialMigration = {
   path: "packages/db/migrations/0001_initial_schema.sql",
   table_count: schemaTables.length,
 } as const;
+
+export const connectionPragmas = ["PRAGMA foreign_keys = ON"] as const;

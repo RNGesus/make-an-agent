@@ -89,6 +89,26 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TRIGGER IF NOT EXISTS repositories_set_updated_at
+AFTER UPDATE ON repositories
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+  UPDATE repositories
+  SET updated_at = CURRENT_TIMESTAMP
+  WHERE id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS repository_policies_set_updated_at
+AFTER UPDATE ON repository_policies
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+  UPDATE repository_policies
+  SET updated_at = CURRENT_TIMESTAMP
+  WHERE repo_id = OLD.repo_id;
+END;
+
 CREATE INDEX IF NOT EXISTS repositories_active_idx ON repositories(is_active);
 CREATE INDEX IF NOT EXISTS tasks_repo_created_idx ON tasks(repo_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS tasks_status_created_idx ON tasks(status, created_at DESC);

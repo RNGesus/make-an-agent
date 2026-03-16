@@ -18,7 +18,13 @@ function commandMatchesAllowedPattern(command: string, patterns: readonly string
     return false;
   }
 
-  return patterns.some((pattern) => new RegExp(pattern).test(command));
+  return patterns.some((pattern) => {
+    try {
+      return new RegExp(pattern).test(command);
+    } catch {
+      return false;
+    }
+  });
 }
 
 export function evaluatePolicyAction(
@@ -43,18 +49,29 @@ export function evaluatePolicyAction(
           : "Edit actions are blocked by repo policy.",
       };
     case "bash": {
+      const hasInvalidPattern = policy.safe_command_patterns.some((pattern) => {
+        try {
+          new RegExp(pattern);
+          return false;
+        } catch {
+          return true;
+        }
+      });
       const safeMatch = commandMatchesAllowedPattern(action.command, policy.safe_command_patterns);
       const allowed = policy.allow_bash && (safeMatch || !action.risky);
 
       return {
-        allowed,
+        allowed: hasInvalidPattern ? false : allowed,
         requires_approval:
+          !hasInvalidPattern &&
           allowed &&
           (!safeMatch || Boolean(action.risky)) &&
           policy.approval_required_for_risky_bash,
-        reason: allowed
-          ? "Bash action is permitted within the repo policy."
-          : "Bash command is outside the allowed policy patterns.",
+        reason: hasInvalidPattern
+          ? "Bash policy contains an invalid safe-command pattern and must be corrected before execution."
+          : allowed
+            ? "Bash action is permitted within the repo policy."
+            : "Bash command is outside the allowed policy patterns.",
       };
     }
     case "git_write":
