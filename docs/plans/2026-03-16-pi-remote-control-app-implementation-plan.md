@@ -32,7 +32,7 @@ Recommended order:
 
 ```text
 apps/
-  web/                # Next.js UI
+  web/                # TanStack Start UI
   server/             # API, queue, orchestration
 packages/
   db/                 # SQLite schema and queries
@@ -466,7 +466,7 @@ Each task detail page should prioritize:
 
 Start by scaffolding the repository with:
 
-- Next.js app
+- TanStack Start app
 - backend API surface
 - SQLite setup
 - first database tables for repos, policies, tasks, approvals, and audit events

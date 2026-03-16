@@ -241,7 +241,7 @@ SQLite is sufficient for v1.
 ## Recommended Tech Stack
 
 - Backend: Node.js + TypeScript
-- Web app: Next.js
+- Web app: TanStack Start
 - App database: SQLite
 - Queue: simple in-process job queue in v1
 - Execution engine: pi-coding-agent via SDK or RPC
