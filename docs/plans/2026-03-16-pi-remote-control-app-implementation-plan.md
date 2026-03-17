@@ -15,12 +15,15 @@ Implement the approved MVP for a web-first control plane around `pi-coding-agent
 - show diffs
 - create pull requests and store PR links
 
+The repository already contains partial implementation for the backend, database, shared packages, and an interim web UI. The remaining work should realign the web foundation safely, preserve usable code, and then continue milestone delivery from an accurate current-state baseline.
+
 ## Delivery Strategy
 
 Build the system in vertical slices so each milestone produces a usable feature.
 
 Recommended order:
 
+0. Foundation realignment and current-state audit.
 1. Repository registry and policy foundation.
 2. Task intake and model routing.
 3. Pi execution integration.
@@ -28,11 +31,32 @@ Recommended order:
 5. Branch, commit, and PR workflow.
 6. Security hardening and observability.
 
+## Current State Assessment
+
+The codebase has already moved beyond a pure scaffold stage, but it does not yet match the planned application foundation.
+
+### Already present
+
+- `apps/web` contains a working operator UI for repository import, policy editing, task intake, approvals, task history, and task detail.
+- `apps/server` already exposes repository, task, and approval-oriented modules.
+- `packages/db` already contains the initial SQLite schema.
+- `packages/task-router`, `packages/policy-engine`, `packages/pi-runner`, and `packages/github` already exist as integration points.
+
+### Current mismatch
+
+- `apps/web` is still a plain Vite app instead of TanStack Start.
+- The current UI is concentrated in a single large entry file instead of a route-oriented application structure.
+- The implementation plan still reads like a greenfield scaffold, which no longer reflects the actual starting point.
+
+### Planning implication
+
+Before continuing milestone delivery, complete a foundation realignment phase that migrates the web app in place, preserves existing flows, and produces a concrete gap list for Milestones 1 through 4.
+
 ## Proposed Application Structure
 
 ```text
 apps/
-  web/                # TanStack Start UI
+  web/                # TanStack Start UI migrated from the current Vite shell
   server/             # API, queue, orchestration
 packages/
   db/                 # SQLite schema and queries
@@ -44,6 +68,61 @@ packages/
 ```
 
 This can still live in a single repository even if the first implementation starts flatter.
+
+## Phase 0: Foundation Realignment And Current-State Audit
+
+### Goals
+
+- Migrate `apps/web` from plain Vite to TanStack Start without discarding the current operator flows.
+- Break the current web entrypoint into a safer route, layout, and component structure.
+- Preserve existing server APIs and shared package contracts during the migration.
+- Produce an implementation gap audit for Milestones 1 through 4 so the next work is based on reality.
+
+### Web work
+
+- Scaffold TanStack Start in `apps/web`.
+- Create route and layout structure for the existing operator surface.
+- Move the current repository, policy, task, approval, and task-detail UI into TanStack Start routes and components.
+- Keep the current API contract working throughout the migration.
+
+### Backend and package work
+
+- Preserve the current `apps/server` surface so the migration does not block existing flows.
+- Verify that shared package boundaries are still appropriate once the web app is route-oriented.
+- Capture follow-up cleanup tasks instead of mixing them into the migration unless they are blocking.
+
+### Audit output
+
+Document which items in Milestones 1 through 4 are:
+
+- already implemented
+- partially implemented
+- blocked by the old web foundation
+- still missing
+
+### Acceptance criteria
+
+- `apps/web` runs as a TanStack Start app.
+- Existing operator flows still work after the migration.
+- The plan for Milestones 1 through 4 is updated from assumptions to verified remaining work.
+
+## Milestone Status Snapshot Before Phase 0
+
+### Milestone 1
+
+Partially implemented: repository scan, registration, and policy editing already exist, but they need to live on the correct web foundation and be re-verified after migration.
+
+### Milestone 2
+
+Partially implemented: task intake, routing persistence, and task detail views already exist, but they need verification and consolidation after the foundation move.
+
+### Milestone 3
+
+Partially implemented: pi-runner integration points and execution-related flows exist, but lifecycle control and storage behavior still need confirmation.
+
+### Milestone 4
+
+Partially implemented: approval records, risky bash scopes, and related UI already exist, but policy enforcement coverage and resume semantics still need hardening.
 
 ## Core Domain Model
 
@@ -158,6 +237,7 @@ Fields:
 
 ### Goals
 
+- Consolidate the existing repository and policy features on top of the migrated web foundation.
 - Configure a parent directory such as `/srv/agent-workspaces/`.
 - Discover candidate repositories from immediate subfolders.
 - Register repositories into the application.
@@ -165,6 +245,7 @@ Fields:
 
 ### Backend work
 
+- Verify and tighten the current repo scan and registration behavior against the approved design.
 - Add config for `WORKSPACE_PARENT_DIR`.
 - Create repo scan service.
 - Create repo registration endpoints.
@@ -172,6 +253,7 @@ Fields:
 
 ### UI work
 
+- Move the existing repository library and policy editor into the final route-oriented structure.
 - Repo library page.
 - Candidate repo scan/import flow.
 - Repo detail page.
@@ -187,6 +269,7 @@ Fields:
 
 ### Goals
 
+- Consolidate the existing task intake and routing flow after the web migration.
 - Submit tasks against a selected repository.
 - Compute deterministic intensity score.
 - Optionally run a cheap classifier for ambiguous tasks.
@@ -194,6 +277,7 @@ Fields:
 
 ### Backend work
 
+- Verify current routing behavior and fill any rule or persistence gaps.
 - Task creation endpoint.
 - Deterministic routing engine.
 - Classifier adapter.
@@ -211,6 +295,7 @@ Use rules first:
 
 ### UI work
 
+- Move the current task creation, task list, and task detail flows into their final app routes.
 - New task form.
 - Task list.
 - Task detail page with routing reason.
@@ -224,6 +309,7 @@ Use rules first:
 
 ### Goals
 
+- Consolidate and verify the existing pi integration points after Phase 0.
 - Run tasks through pi in a controlled way.
 - Persist pi session identifiers.
 - Capture result summaries and artifacts.
@@ -255,6 +341,7 @@ Decision checkpoint:
 
 ### Goals
 
+- Consolidate and harden the existing approval flow after the foundation migration.
 - Enforce hard workspace boundaries.
 - Require approval for protected actions.
 - Resume execution after approval.
@@ -276,6 +363,7 @@ Decision checkpoint:
 
 ### UI work
 
+- Keep the current approvals workflow working while moving it into the final route layout.
 - approvals inbox
 - approval detail panel
 - approve risky bash commands once, for the session, or globally
@@ -439,24 +527,24 @@ Each task detail page should prioritize:
 
 ### First coding slice
 
-1. Bootstrap monorepo or app structure.
-2. Add SQLite schema and migration setup.
-3. Implement repository scan and registration.
-4. Implement policy model and editor.
-5. Implement task creation and routing.
+1. Scaffold TanStack Start in `apps/web`.
+2. Introduce route, layout, and component structure around the current operator UI.
+3. Migrate the existing repository, policy, task, approval, and task detail flows into that structure.
+4. Keep the current API contract working during the migration.
+5. Produce a verified gap list for Milestones 1 through 4.
 
 ### Second coding slice
 
-1. Add pi runner wrapper.
-2. Execute read-only tasks.
-3. Persist task results and session references.
-4. Render task detail page.
+1. Close remaining Milestone 1 gaps in repo registry and policy behavior.
+2. Close remaining Milestone 2 gaps in task intake and routing.
+3. Verify persisted task results and session references against the plan.
+4. Tighten the task detail route structure after the migration settles.
 
 ### Third coding slice
 
-1. Add approval checkpoints.
-2. Add diff capture.
-3. Add commit and PR flow.
+1. Close remaining Milestone 3 gaps in pi execution handling.
+2. Close remaining Milestone 4 gaps in approvals and diff capture.
+3. Then continue with commit and PR flow.
 
 ## Open Decisions To Resolve During Implementation
 
@@ -467,11 +555,11 @@ Each task detail page should prioritize:
 
 ## Recommended Immediate Next Step
 
-Start by scaffolding the repository with:
+Start with Phase 0 foundation realignment:
 
-- TanStack Start app
-- backend API surface
-- SQLite setup
-- first database tables for repos, policies, tasks, approvals, and audit events
+- scaffold TanStack Start in `apps/web`
+- preserve the current backend API surface and package contracts
+- migrate the current operator UI into TanStack Start routes and components
+- produce a milestone gap audit based on the migrated app
 
-Then build the repo registry and policy editor before integrating pi execution.
+Then resume Milestone 1 work from the verified gap list instead of from a greenfield scaffold assumption.

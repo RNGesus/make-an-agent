@@ -50,6 +50,16 @@ The application adds the product layer that pi does not provide out of the box:
 - diff and PR workflow
 - auditability
 
+## Current Implementation Reality
+
+The repository is no longer greenfield.
+
+- `apps/web` currently exists as a plain Vite application rather than a TanStack Start app.
+- `apps/server` and multiple shared packages already contain partial implementation for repositories, tasks, approvals, routing, policy, database access, and pi integration.
+- The next step should preserve those assets and migrate the web foundation safely instead of restarting the implementation from scratch.
+
+This means the delivery plan should include a foundation realignment phase before milestone work continues.
+
 ## Architecture
 
 ### Main components
@@ -243,13 +253,14 @@ SQLite is sufficient for v1.
 ## Recommended Tech Stack
 
 - Backend: Node.js + TypeScript
-- Web app: TanStack Start
+- Web app: TanStack Start, with an in-place migration from the current plain Vite `apps/web`
 - App database: SQLite
 - Queue: simple in-process job queue in v1
 - Execution engine: pi-coding-agent via SDK or RPC
 
 ## Implementation Phases
 
+0. Foundation realignment: migrate `apps/web` to TanStack Start, preserve working server and package code, and re-baseline the remaining milestone gaps.
 1. Repo registry and per-repo policy.
 2. Task intake and intensity routing.
 3. Pi execution wrapper.
@@ -269,3 +280,4 @@ SQLite is sufficient for v1.
 - Diffs and PR workflow are first-class features.
 - Hybrid routing with rules first and classifier second.
 - Use pi persistence for sessions and SQLite for app-level state.
+- Preserve existing backend and domain work, then migrate the web foundation safely before continuing milestone delivery.
