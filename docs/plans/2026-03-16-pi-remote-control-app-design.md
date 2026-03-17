@@ -155,6 +155,7 @@ The system should:
 
 - allow safe read and test commands automatically when policy allows
 - pause for approval on write-like or destructive commands
+- support risky bash approvals with `once`, `session`, and `global` scopes
 - record audit details for policy decisions
 
 ## Task Flow
@@ -164,7 +165,8 @@ The system should:
 3. Router selects cheap or strong model.
 4. Safe read-only analysis and safe test commands may auto-run.
 5. Writes, commits, PR creation, or risky commands pause for approval depending on repo policy.
-6. Result is stored as compact artifacts for the UI.
+6. Risky bash approvals can be granted once, for the current task session, or globally for the repo.
+7. Result is stored as compact artifacts for the UI.
 
 ## Intensity Scoring And Model Routing
 

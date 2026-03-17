@@ -264,6 +264,7 @@ Decision checkpoint:
 - validate every file path against `allowed_root`
 - resolve real paths and reject symlink escape
 - classify bash commands into safe vs approval-required
+- persist risky bash approvals by exact command fingerprint with `once`, `session`, and `global` scopes
 - block actions denied by repo policy
 
 ### Approval types
@@ -277,12 +278,14 @@ Decision checkpoint:
 
 - approvals inbox
 - approval detail panel
-- approve or reject actions
+- approve risky bash commands once, for the session, or globally
+- reject actions
 
 ### Acceptance criteria
 
 - A task requiring edits pauses and creates an approval record.
 - After approval, execution resumes.
+- Risky bash commands can be re-enabled per command instead of disabling the entire bash tool.
 - Blocked paths and commands produce audit events.
 
 ## Milestone 5: Diff Review And Git Workflow
