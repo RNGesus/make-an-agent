@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readdirSync, realpathSync, statSync } from "node:fs";
-import { dirname, resolve as resolvePath, sep } from "node:path";
+import { dirname, relative as relativePath, resolve as resolvePath, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   bootstrapControlPlaneDatabase,
@@ -25,9 +25,11 @@ import {
   replaceTaskArtifacts,
   resolveApproval,
   type RepositoryPolicyValues,
+  upsertTaskArtifacts,
   updateTaskExecution,
   updateRepositoryPolicy,
 } from "db/runtime";
+import { buildPullRequestDraft } from "github";
 import { evaluatePolicyAction } from "policy-engine";
 import {
   approvalScopes,
@@ -114,6 +116,50 @@ type CreateTaskBody = {
 type ApprovalDecisionBody = {
   decided_by?: string;
   scope?: string;
+};
+
+type CommitTaskBody = {
+  message?: string;
+};
+
+type CreatePullRequestBody = {
+  title?: string;
+  body?: string;
+};
+
+type OperatorActionKind = "commit" | "pull_request";
+
+type OperatorActionRequestPayload = {
+  approval_flow: "operator_action";
+  operator_action: OperatorActionKind;
+  repo_id: string;
+  repo_name: string;
+  task_id: string;
+  task_title: string;
+  goal_type: TaskGoalType;
+  routing_tier: "cheap" | "strong" | null;
+  branch_name: string;
+  commit_message: string | null;
+  pr_title: string | null;
+  pr_body: string | null;
+};
+
+type TaskDiffResponse = {
+  base_branch: string;
+  branch_name: string | null;
+  current_branch: string | null;
+  head_sha: string | null;
+  ahead_by: number;
+  behind_by: number;
+  has_changes: boolean;
+  changed_files: Array<{ path: string; status: string }>;
+  diff_stat: string;
+  patch: string;
+};
+
+type TaskActionResponse = {
+  approval: ReturnType<typeof getApproval>;
+  task: NonNullable<ReturnType<typeof getTaskDetail>>;
 };
 
 export interface CreateServerAppOptions extends Partial<ServerConfig> {
@@ -388,6 +434,79 @@ async function routeRequest(
     return jsonResponse(request, config, 200, executedTask);
   }
 
+  const taskDiffMatch = matchTaskDiff(url.pathname);
+
+  if (request.method === "GET" && taskDiffMatch) {
+    try {
+      const diff = getTaskDiff(database, taskDiffMatch.taskId);
+
+      return diff
+        ? jsonResponse(request, config, 200, diff)
+        : jsonResponse(request, config, 404, {
+            error: `Task '${taskDiffMatch.taskId}' was not found.`,
+          });
+    } catch (error) {
+      return jsonResponse(request, config, 400, {
+        error: error instanceof Error ? error.message : "Could not collect task diff.",
+      });
+    }
+  }
+
+  const taskCommitMatch = matchTaskCommit(url.pathname);
+
+  if (request.method === "POST" && taskCommitMatch) {
+    const body = await readJsonBody(request);
+
+    if (body !== null && !isCommitTaskBody(body)) {
+      return jsonResponse(request, config, 400, {
+        error: "Commit requests must be a JSON object with an optional string message field.",
+      });
+    }
+
+    try {
+      const result = executeTaskOperatorAction(
+        database,
+        taskCommitMatch.taskId,
+        "commit",
+        body && isCommitTaskBody(body) ? body : {},
+      );
+
+      return jsonResponse(request, config, 200, result);
+    } catch (error) {
+      return jsonResponse(request, config, 400, {
+        error: error instanceof Error ? error.message : "Could not commit task changes.",
+      });
+    }
+  }
+
+  const taskPullRequestMatch = matchTaskPullRequest(url.pathname);
+
+  if (request.method === "POST" && taskPullRequestMatch) {
+    const body = await readJsonBody(request);
+
+    if (body !== null && !isCreatePullRequestBody(body)) {
+      return jsonResponse(request, config, 400, {
+        error:
+          "Pull request requests must be a JSON object with optional string title and body fields.",
+      });
+    }
+
+    try {
+      const result = executeTaskOperatorAction(
+        database,
+        taskPullRequestMatch.taskId,
+        "pull_request",
+        body && isCreatePullRequestBody(body) ? body : {},
+      );
+
+      return jsonResponse(request, config, 200, result);
+    } catch (error) {
+      return jsonResponse(request, config, 400, {
+        error: error instanceof Error ? error.message : "Could not create the task pull request.",
+      });
+    }
+  }
+
   const approveMatch = matchApprovalApprove(url.pathname);
 
   if (request.method === "POST" && approveMatch) {
@@ -438,6 +557,7 @@ async function routeRequest(
     }
 
     const context = getTaskExecutionContext(database, resolved.task_id);
+    const operatorPayload = parseOperatorActionRequestPayload(resolved.requested_payload_json);
     const riskyBashPayload =
       resolved.approval_type === "risky_bash"
         ? parseRiskyBashApprovalPayload(resolved.requested_payload_json)
@@ -478,7 +598,10 @@ async function routeRequest(
       );
     }
 
-    const task = await maybeExecuteTask(database, config, resolved.task_id, "resume", piRuntime);
+    const task =
+      operatorPayload?.approval_flow === "operator_action"
+        ? executeApprovedOperatorAction(database, resolved.task_id, operatorPayload)
+        : await maybeExecuteTask(database, config, resolved.task_id, "resume", piRuntime);
 
     return jsonResponse(request, config, 200, {
       approval: resolved,
@@ -527,26 +650,44 @@ async function routeRequest(
 
     const context = getTaskExecutionContext(database, resolved.task_id);
 
+    const operatorPayload = parseOperatorActionRequestPayload(resolved.requested_payload_json);
+
     if (context) {
-      updateTaskExecution(database, resolved.task_id, {
-        status: "failed",
-        pi_session_id: context.task.pi_session_id,
-        branch_name: context.task.branch_name,
-        started_at: context.task.started_at,
-        completed_at: new Date().toISOString(),
-      });
-      recordAuditEvent(
-        database,
-        context.repository.id,
-        context.task.id,
-        "task.approval.rejected",
-        "Rejected the pending task action.",
-        {
-          approval_id: resolved.id,
-          approval_type: resolved.approval_type,
-          decided_by: decidedBy,
-        },
-      );
+      if (operatorPayload?.approval_flow === "operator_action") {
+        recordAuditEvent(
+          database,
+          context.repository.id,
+          context.task.id,
+          "task.approval.rejected",
+          "Rejected the pending task action.",
+          {
+            approval_id: resolved.id,
+            approval_type: resolved.approval_type,
+            decided_by: decidedBy,
+            operator_action: operatorPayload.operator_action,
+          },
+        );
+      } else {
+        updateTaskExecution(database, resolved.task_id, {
+          status: "failed",
+          pi_session_id: context.task.pi_session_id,
+          branch_name: context.task.branch_name,
+          started_at: context.task.started_at,
+          completed_at: new Date().toISOString(),
+        });
+        recordAuditEvent(
+          database,
+          context.repository.id,
+          context.task.id,
+          "task.approval.rejected",
+          "Rejected the pending task action.",
+          {
+            approval_id: resolved.id,
+            approval_type: resolved.approval_type,
+            decided_by: decidedBy,
+          },
+        );
+      }
     }
 
     return jsonResponse(request, config, 200, {
@@ -740,6 +881,24 @@ function matchTaskRetry(pathname: string) {
   return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
 }
 
+function matchTaskDiff(pathname: string) {
+  const match = /^\/api\/tasks\/([^/]+)\/diff$/.exec(pathname);
+
+  return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
+}
+
+function matchTaskCommit(pathname: string) {
+  const match = /^\/api\/tasks\/([^/]+)\/commit$/.exec(pathname);
+
+  return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
+}
+
+function matchTaskPullRequest(pathname: string) {
+  const match = /^\/api\/tasks\/([^/]+)\/pr$/.exec(pathname);
+
+  return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
+}
+
 function matchApprovalApprove(pathname: string) {
   const match = /^\/api\/approvals\/([^/]+)\/approve$/.exec(pathname);
 
@@ -808,6 +967,18 @@ function isCreateTaskBody(value: unknown): value is CreateTaskBody {
     (value.title === undefined || typeof value.title === "string") &&
     (value.goal_type === undefined || typeof value.goal_type === "string") &&
     (value.expected_file_count === undefined || typeof value.expected_file_count === "number")
+  );
+}
+
+function isCommitTaskBody(value: unknown): value is CommitTaskBody {
+  return isObject(value) && (value.message === undefined || typeof value.message === "string");
+}
+
+function isCreatePullRequestBody(value: unknown): value is CreatePullRequestBody {
+  return (
+    isObject(value) &&
+    (value.title === undefined || typeof value.title === "string") &&
+    (value.body === undefined || typeof value.body === "string")
   );
 }
 
@@ -1116,6 +1287,9 @@ async function maybeExecuteTask(
     executionReason === "resume" && context.task.started_at
       ? context.task.started_at
       : new Date().toISOString();
+  const activeBranchName = requiresTaskBranch(context.task.goal_type)
+    ? ensureTaskBranchForTask(context)
+    : context.task.branch_name;
   const claimedExecution = claimTaskExecution(
     database,
     taskId,
@@ -1123,7 +1297,7 @@ async function maybeExecuteTask(
     {
       status: "running",
       pi_session_id: context.task.pi_session_id,
-      branch_name: context.task.branch_name,
+      branch_name: activeBranchName,
       started_at: startedAt,
       completed_at: null,
     },
@@ -1178,7 +1352,7 @@ async function maybeExecuteTask(
     updateTaskExecution(database, taskId, {
       status: "completed",
       pi_session_id: result.session_id,
-      branch_name: context.task.branch_name,
+      branch_name: activeBranchName,
       started_at: startedAt,
       completed_at: new Date().toISOString(),
     });
@@ -1231,7 +1405,7 @@ async function maybeExecuteTask(
       updateTaskExecution(database, taskId, {
         status: "awaiting_approval",
         pi_session_id: context.task.pi_session_id,
-        branch_name: context.task.branch_name,
+        branch_name: activeBranchName,
         started_at: startedAt,
         completed_at: null,
       });
@@ -1249,7 +1423,7 @@ async function maybeExecuteTask(
       updateTaskExecution(database, taskId, {
         status: "failed",
         pi_session_id: context.task.pi_session_id,
-        branch_name: context.task.branch_name,
+        branch_name: activeBranchName,
         started_at: startedAt,
         completed_at: new Date().toISOString(),
       });
@@ -1276,7 +1450,7 @@ async function maybeExecuteTask(
     updateTaskExecution(database, taskId, {
       status: "failed",
       pi_session_id: context.task.pi_session_id,
-      branch_name: context.task.branch_name,
+      branch_name: activeBranchName,
       started_at: startedAt,
       completed_at: new Date().toISOString(),
     });
@@ -1428,6 +1602,495 @@ function buildPiRunnerRuntime(
   };
 }
 
+function getTaskDiff(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  taskId: string,
+): TaskDiffResponse | null {
+  const context = getTaskExecutionContext(database, taskId);
+
+  if (!context) {
+    return null;
+  }
+
+  return collectTaskDiff(context);
+}
+
+function executeTaskOperatorAction(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  taskId: string,
+  action: OperatorActionKind,
+  body: CommitTaskBody | CreatePullRequestBody,
+): TaskActionResponse {
+  const context = getTaskExecutionContext(database, taskId);
+
+  if (!context) {
+    throw new Error(`Task '${taskId}' was not found.`);
+  }
+
+  assertTaskReadyForOperatorAction(context.task.status, action);
+
+  if (!requiresTaskBranch(context.task.goal_type)) {
+    throw new Error(`Task '${taskId}' does not produce a task branch for ${action}.`);
+  }
+
+  const branchName = ensureTaskBranchForTask(context);
+
+  if (action === "commit") {
+    const commitMessage =
+      normalizeOptionalText((body as CommitTaskBody).message) ?? defaultCommitMessage(context);
+    const decision = evaluatePolicyAction(context.policy, { kind: "git_write" });
+
+    if (!decision.allowed) {
+      recordAuditEvent(
+        database,
+        context.repository.id,
+        context.task.id,
+        "task.git.blocked",
+        decision.reason,
+        {
+          action,
+          branch_name: branchName,
+        },
+      );
+      throw new Error(decision.reason);
+    }
+
+    if (decision.requires_approval) {
+      return requestOperatorApproval(database, context, "commit", {
+        branch_name: branchName,
+        commit_message: commitMessage,
+        pr_body: null,
+        pr_title: null,
+      });
+    }
+
+    return {
+      approval: null,
+      task: performTaskCommit(database, context, branchName, commitMessage),
+    };
+  }
+
+  const prTitle = normalizeOptionalText((body as CreatePullRequestBody).title);
+  const prBody = normalizeOptionalText((body as CreatePullRequestBody).body);
+  const decision = evaluatePolicyAction(context.policy, { kind: "pull_request" });
+
+  if (!decision.allowed) {
+    recordAuditEvent(
+      database,
+      context.repository.id,
+      context.task.id,
+      "task.git.blocked",
+      decision.reason,
+      {
+        action,
+        branch_name: branchName,
+      },
+    );
+    throw new Error(decision.reason);
+  }
+
+  if (decision.requires_approval) {
+    return requestOperatorApproval(database, context, "pull_request", {
+      branch_name: branchName,
+      commit_message: null,
+      pr_body: prBody,
+      pr_title: prTitle,
+    });
+  }
+
+  return {
+    approval: null,
+    task: performTaskPullRequestDraft(database, context, branchName, {
+      title: prTitle,
+      body: prBody,
+    }),
+  };
+}
+
+function executeApprovedOperatorAction(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  taskId: string,
+  payload: OperatorActionRequestPayload,
+) {
+  const context = getTaskExecutionContext(database, taskId);
+
+  if (!context) {
+    throw new Error(`Task '${taskId}' was not found for the approved operator action.`);
+  }
+
+  const branchName = ensureTaskBranchForTask(context);
+
+  switch (payload.operator_action) {
+    case "commit":
+      return performTaskCommit(
+        database,
+        context,
+        branchName,
+        payload.commit_message ?? defaultCommitMessage(context),
+      );
+    case "pull_request":
+      return performTaskPullRequestDraft(database, context, branchName, {
+        title: payload.pr_title,
+        body: payload.pr_body,
+      });
+  }
+}
+
+function requestOperatorApproval(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+  action: OperatorActionKind,
+  payload: Pick<
+    OperatorActionRequestPayload,
+    "branch_name" | "commit_message" | "pr_body" | "pr_title"
+  >,
+): TaskActionResponse {
+  const existingApproval = getPendingTaskApproval(
+    database,
+    context.task.id,
+    action === "commit" ? "commit" : "pull_request",
+  );
+
+  if (existingApproval) {
+    const detail = getTaskDetail(database, context.task.id);
+
+    if (!detail) {
+      throw new Error(`Task '${context.task.id}' disappeared while waiting for approval.`);
+    }
+
+    return {
+      approval: existingApproval,
+      task: detail,
+    };
+  }
+
+  const approval = createApproval(database, {
+    task_id: context.task.id,
+    approval_type: action === "commit" ? "commit" : "pull_request",
+    requested_action:
+      action === "commit"
+        ? "Approve committing the task branch."
+        : "Approve generating a pull request draft for the task branch.",
+    requested_payload_json: JSON.stringify({
+      approval_flow: "operator_action",
+      operator_action: action,
+      repo_id: context.repository.id,
+      repo_name: context.repository.name,
+      task_id: context.task.id,
+      task_title: context.task.title,
+      goal_type: context.task.goal_type,
+      routing_tier: context.task.routing_tier,
+      branch_name: payload.branch_name,
+      commit_message: payload.commit_message,
+      pr_title: payload.pr_title,
+      pr_body: payload.pr_body,
+    } satisfies OperatorActionRequestPayload),
+  });
+
+  if (!approval) {
+    throw new Error(`Task '${context.task.id}' could not create its ${action} approval.`);
+  }
+
+  recordAuditEvent(
+    database,
+    context.repository.id,
+    context.task.id,
+    "task.approval.requested",
+    action === "commit"
+      ? "Task commit is waiting for operator approval."
+      : "Pull request draft generation is waiting for operator approval.",
+    {
+      approval_id: approval.id,
+      approval_type: approval.approval_type,
+      operator_action: action,
+      branch_name: payload.branch_name,
+    },
+  );
+
+  const detail = getTaskDetail(database, context.task.id);
+
+  if (!detail) {
+    throw new Error(`Task '${context.task.id}' disappeared while creating its approval.`);
+  }
+
+  return {
+    approval,
+    task: detail,
+  };
+}
+
+function performTaskCommit(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+  branchName: string,
+  commitMessage: string,
+) {
+  const pathspec = taskPathspec(context);
+  const diff = collectTaskDiff(context);
+
+  if (!diff.has_changes) {
+    throw new Error("No task changes are available to commit.");
+  }
+
+  runGit(context.repository.root_path, ["add", "--", pathspec]);
+  runGit(context.repository.root_path, ["commit", "-m", commitMessage, "--", pathspec]);
+
+  const commitSha =
+    runGit(context.repository.root_path, ["rev-parse", "--short", "HEAD"])?.trim() ?? "unknown";
+  const committedAt = new Date().toISOString();
+
+  upsertTaskArtifacts(database, context.task.id, [
+    {
+      artifact_type: "commit_metadata",
+      summary: `Committed ${branchName} at ${commitSha}.`,
+      payload_json: JSON.stringify({
+        branch_name: branchName,
+        committed_at: committedAt,
+        message: commitMessage,
+        sha: commitSha,
+      }),
+    },
+  ]);
+  recordAuditEvent(
+    database,
+    context.repository.id,
+    context.task.id,
+    "task.git.committed",
+    "Committed task branch changes.",
+    {
+      branch_name: branchName,
+      commit_sha: commitSha,
+      message: commitMessage,
+    },
+  );
+
+  const detail = getTaskDetail(database, context.task.id);
+
+  if (!detail) {
+    throw new Error(`Task '${context.task.id}' was not available after committing changes.`);
+  }
+
+  return detail;
+}
+
+function performTaskPullRequestDraft(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+  branchName: string,
+  overrides: { title: string | null; body: string | null },
+) {
+  const diff = collectTaskDiff(context);
+
+  if (diff.has_changes) {
+    throw new Error("Commit the current task changes before creating a pull request draft.");
+  }
+
+  const detail = getTaskDetail(database, context.task.id);
+
+  if (!detail) {
+    throw new Error(`Task '${context.task.id}' was not available while drafting the pull request.`);
+  }
+
+  const draft = buildPullRequestDraft({
+    task: {
+      title: context.task.title,
+      routing_reason: context.task.routing_reason,
+      branch_name: branchName,
+    },
+    base_branch: context.repository.default_branch,
+    artifact_summaries: detail.artifacts.map((artifact) => artifact.summary),
+  });
+  const title = overrides.title ?? draft.title;
+  const body = overrides.body ?? draft.body;
+  const headSha =
+    runGit(context.repository.root_path, ["rev-parse", "--short", "HEAD"])?.trim() ?? "unknown";
+  const compareUrl =
+    context.repository.github_owner && context.repository.github_repo
+      ? `https://github.com/${context.repository.github_owner}/${context.repository.github_repo}/compare/${encodeURIComponent(draft.base_branch)}...${encodeURIComponent(draft.head_branch)}?expand=1`
+      : null;
+
+  upsertTaskArtifacts(database, context.task.id, [
+    {
+      artifact_type: "pr_metadata",
+      summary: `Prepared a PR draft from ${draft.head_branch} into ${draft.base_branch}.`,
+      payload_json: JSON.stringify({
+        base_branch: draft.base_branch,
+        body,
+        compare_url: compareUrl,
+        head_branch: draft.head_branch,
+        head_sha: headSha,
+        remote_url: context.repository.remote_url,
+        status: "drafted",
+        title,
+      }),
+    },
+  ]);
+  recordAuditEvent(
+    database,
+    context.repository.id,
+    context.task.id,
+    "task.git.pr_drafted",
+    "Prepared a pull request draft from the task branch.",
+    {
+      base_branch: draft.base_branch,
+      branch_name: draft.head_branch,
+      compare_url: compareUrl,
+      head_sha: headSha,
+    },
+  );
+
+  const nextDetail = getTaskDetail(database, context.task.id);
+
+  if (!nextDetail) {
+    throw new Error(`Task '${context.task.id}' was not available after drafting the pull request.`);
+  }
+
+  return nextDetail;
+}
+
+function collectTaskDiff(
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+): TaskDiffResponse {
+  const pathspec = taskPathspec(context);
+  const currentBranch = currentGitBranch(context.repository.root_path);
+  const headSha =
+    runGit(context.repository.root_path, ["rev-parse", "--short", "HEAD"], false)?.trim() ?? null;
+  const statusOutput =
+    runGit(
+      context.repository.root_path,
+      ["status", "--short", "--untracked-files=all", "--", pathspec],
+      false,
+    ) ?? "";
+  const diffStat =
+    runGit(context.repository.root_path, ["diff", "--stat", "--", pathspec], false)?.trim() ?? "";
+  const patch =
+    runGit(context.repository.root_path, ["diff", "--no-color", "--", pathspec], false)?.trim() ??
+    "";
+  const { aheadBy, behindBy } =
+    context.task.branch_name === null
+      ? { aheadBy: 0, behindBy: 0 }
+      : branchDistance(
+          context.repository.root_path,
+          context.repository.default_branch,
+          context.task.branch_name,
+        );
+  const changedFiles = parseGitStatusLines(statusOutput);
+
+  return {
+    base_branch: context.repository.default_branch,
+    branch_name: context.task.branch_name,
+    current_branch: currentBranch,
+    head_sha: headSha,
+    ahead_by: aheadBy,
+    behind_by: behindBy,
+    has_changes: changedFiles.length > 0,
+    changed_files: changedFiles,
+    diff_stat: diffStat,
+    patch,
+  };
+}
+
+function requiresTaskBranch(goalType: TaskGoalType) {
+  return goalType !== "question" && goalType !== "plan";
+}
+
+function ensureTaskBranchForTask(context: NonNullable<ReturnType<typeof getTaskExecutionContext>>) {
+  const branchName =
+    context.task.branch_name ?? buildTaskBranchName(context.task.id, context.task.title);
+  const currentBranch = currentGitBranch(context.repository.root_path);
+
+  if (currentBranch === branchName) {
+    return branchName;
+  }
+
+  if (hasLocalBranch(context.repository.root_path, branchName)) {
+    runGit(context.repository.root_path, ["checkout", branchName]);
+    return branchName;
+  }
+
+  if (currentBranch !== context.repository.default_branch) {
+    runGit(context.repository.root_path, ["checkout", context.repository.default_branch]);
+  }
+
+  runGit(context.repository.root_path, ["checkout", "-b", branchName]);
+
+  return branchName;
+}
+
+function hasLocalBranch(rootPath: string, branchName: string) {
+  return (
+    runGit(rootPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], false) !==
+    null
+  );
+}
+
+function currentGitBranch(rootPath: string) {
+  const branch = runGit(rootPath, ["rev-parse", "--abbrev-ref", "HEAD"], false)?.trim();
+
+  return branch && branch !== "HEAD" ? branch : null;
+}
+
+function branchDistance(rootPath: string, baseBranch: string, branchName: string) {
+  const output =
+    runGit(
+      rootPath,
+      ["rev-list", "--left-right", "--count", `${baseBranch}...${branchName}`],
+      false,
+    )?.trim() ?? "";
+  const [behindRaw, aheadRaw] = output.split(/\s+/);
+
+  return {
+    aheadBy: Number.parseInt(aheadRaw ?? "0", 10) || 0,
+    behindBy: Number.parseInt(behindRaw ?? "0", 10) || 0,
+  };
+}
+
+function taskPathspec(context: NonNullable<ReturnType<typeof getTaskExecutionContext>>) {
+  const relativeRoot = relativePath(context.repository.root_path, context.policy.allowed_root);
+
+  return relativeRoot.length === 0 ? "." : relativeRoot;
+}
+
+function parseGitStatusLines(output: string) {
+  return output
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .map((line) => ({
+      status: line.slice(0, 2).trim() || "modified",
+      path: line.slice(3).trim(),
+    }));
+}
+
+function buildTaskBranchName(taskId: string, taskTitle: string) {
+  const slug = taskTitle
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+
+  return `task/${slug || "task"}-${taskId.slice(0, 8)}`;
+}
+
+function defaultCommitMessage(context: NonNullable<ReturnType<typeof getTaskExecutionContext>>) {
+  return `Task: ${context.task.title}`;
+}
+
+function normalizeOptionalText(value: string | undefined) {
+  const trimmed = value?.trim();
+
+  return trimmed ? trimmed : null;
+}
+
+function assertTaskReadyForOperatorAction(
+  status: NonNullable<ReturnType<typeof getTaskExecutionContext>>["task"]["status"],
+  action: OperatorActionKind,
+) {
+  if (status === "queued" || status === "running" || status === "awaiting_approval") {
+    throw new Error(`Task ${action} is unavailable while the task status is '${status}'.`);
+  }
+}
+
 function isImmediateChild(parentRoot: string, childRoot: string) {
   return dirname(childRoot) === parentRoot;
 }
@@ -1554,6 +2217,45 @@ function parseRiskyBashApprovalPayload(value: string): RiskyBashApprovalRequestP
       command: payload.command,
       command_fingerprint: payload.command_fingerprint,
       session_key: payload.session_key,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseOperatorActionRequestPayload(value: string): OperatorActionRequestPayload | null {
+  try {
+    const payload = JSON.parse(value) as Record<string, unknown>;
+
+    if (
+      payload.approval_flow !== "operator_action" ||
+      (payload.operator_action !== "commit" && payload.operator_action !== "pull_request") ||
+      typeof payload.repo_id !== "string" ||
+      typeof payload.repo_name !== "string" ||
+      typeof payload.task_id !== "string" ||
+      typeof payload.task_title !== "string" ||
+      typeof payload.goal_type !== "string" ||
+      typeof payload.branch_name !== "string"
+    ) {
+      return null;
+    }
+
+    return {
+      approval_flow: "operator_action",
+      operator_action: payload.operator_action,
+      repo_id: payload.repo_id,
+      repo_name: payload.repo_name,
+      task_id: payload.task_id,
+      task_title: payload.task_title,
+      goal_type: toTaskGoalType(payload.goal_type),
+      routing_tier:
+        payload.routing_tier === "cheap" || payload.routing_tier === "strong"
+          ? payload.routing_tier
+          : null,
+      branch_name: payload.branch_name,
+      commit_message: typeof payload.commit_message === "string" ? payload.commit_message : null,
+      pr_title: typeof payload.pr_title === "string" ? payload.pr_title : null,
+      pr_body: typeof payload.pr_body === "string" ? payload.pr_body : null,
     };
   } catch {
     return null;

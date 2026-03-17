@@ -26,6 +26,24 @@ export type TaskDetail = TaskSummary & {
   audit_events: AuditEventRecord[];
 };
 
+export type TaskDiff = {
+  ahead_by: number;
+  base_branch: string;
+  behind_by: number;
+  branch_name: string | null;
+  changed_files: Array<{ path: string; status: string }>;
+  current_branch: string | null;
+  diff_stat: string;
+  has_changes: boolean;
+  head_sha: string | null;
+  patch: string;
+};
+
+export type TaskActionResult = {
+  approval: ApprovalRecord | null;
+  task: TaskDetail;
+};
+
 export type RepositoryScanCandidate = {
   default_branch: string;
   github_owner: string | null;

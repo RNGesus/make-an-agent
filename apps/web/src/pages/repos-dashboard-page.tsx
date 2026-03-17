@@ -129,6 +129,48 @@ export function ReposDashboardPage(props: { repoId?: string; taskId?: string }) 
             tasks={workspace.tasks}
           />
           <TaskDetailPanel
+            onCommit={async (taskId, message) => {
+              const result = await workspace.commitTask(taskId, message);
+
+              if (result?.approval) {
+                void navigate({
+                  params: { approvalId: result.approval.id },
+                  to: "/approvals/$approvalId",
+                });
+                return;
+              }
+
+              if (result) {
+                void navigate({
+                  params: {
+                    repoId: result.task.repository.id,
+                    taskId: result.task.task.id,
+                  },
+                  to: "/repos/$repoId/tasks/$taskId",
+                });
+              }
+            }}
+            onCreatePullRequest={async (taskId) => {
+              const result = await workspace.createPullRequest(taskId);
+
+              if (result?.approval) {
+                void navigate({
+                  params: { approvalId: result.approval.id },
+                  to: "/approvals/$approvalId",
+                });
+                return;
+              }
+
+              if (result) {
+                void navigate({
+                  params: {
+                    repoId: result.task.repository.id,
+                    taskId: result.task.task.id,
+                  },
+                  to: "/repos/$repoId/tasks/$taskId",
+                });
+              }
+            }}
             onRetry={async (taskId) => {
               const detail = await workspace.retryTask(taskId);
 
@@ -142,6 +184,7 @@ export function ReposDashboardPage(props: { repoId?: string; taskId?: string }) 
                 });
               }
             }}
+            taskDiff={workspace.selectedTaskDiff}
             taskDetail={workspace.selectedTask}
           />
         </section>

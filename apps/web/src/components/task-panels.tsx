@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { taskGoalTypes, type ApprovalRecord, type AuditEventRecord } from "shared";
-import type { RepositoryDetail, TaskDetail, TaskSummary } from "../lib/operator-api";
+import type { RepositoryDetail, TaskDetail, TaskDiff, TaskSummary } from "../lib/operator-api";
 import {
   readApprovalRequestMeta,
   readApprovalScope,
@@ -21,7 +21,10 @@ type TaskListPanelProps = {
 };
 
 type TaskDetailPanelProps = {
+  onCommit: (taskId: string, message?: string) => Promise<void>;
+  onCreatePullRequest: (taskId: string) => Promise<void>;
   onRetry: (taskId: string) => Promise<void>;
+  taskDiff: TaskDiff | null;
   taskDetail: TaskDetail | null;
 };
 
@@ -163,13 +166,23 @@ export function TaskDetailPanel(props: TaskDetailPanelProps) {
           Select a task to inspect the stored session, artifacts, and routing record.
         </p>
       ) : (
-        <TaskDetailContent taskDetail={taskDetail} />
+        <TaskDetailContent
+          onCommit={props.onCommit}
+          onCreatePullRequest={props.onCreatePullRequest}
+          taskDetail={taskDetail}
+          taskDiff={props.taskDiff}
+        />
       )}
     </article>
   );
 }
 
-function TaskDetailContent(props: { taskDetail: TaskDetail }) {
+function TaskDetailContent(props: {
+  onCommit: (taskId: string, message?: string) => Promise<void>;
+  onCreatePullRequest: (taskId: string) => Promise<void>;
+  taskDetail: TaskDetail;
+  taskDiff: TaskDiff | null;
+}) {
   const { artifacts, approvals, audit_events: auditEvents, repository, task } = props.taskDetail;
   const classifierConfidence =
     task.classifier_confidence === null
@@ -182,6 +195,21 @@ function TaskDetailContent(props: { taskDetail: TaskDetail }) {
   const diffSummary = readArtifactValue<{ stat?: string }>(artifacts, "diff_summary")?.stat ?? null;
   const executionNotes =
     readArtifactValue<{ notes?: string[] }>(artifacts, "execution_notes")?.notes ?? [];
+  const commitMetadata = readArtifactValue<{
+    branch_name?: string;
+    committed_at?: string;
+    message?: string;
+    sha?: string;
+  }>(artifacts, "commit_metadata");
+  const pullRequestMetadata = readArtifactValue<{
+    base_branch?: string;
+    body?: string;
+    compare_url?: string | null;
+    head_branch?: string;
+    head_sha?: string;
+    status?: string;
+    title?: string;
+  }>(artifacts, "pr_metadata");
 
   return (
     <div className="detail-stack">
@@ -237,6 +265,19 @@ function TaskDetailContent(props: { taskDetail: TaskDetail }) {
         </div>
       </TaskSection>
 
+      <TaskSection title="Branch and diff">
+        <div className="detail-card detail-card-stack">
+          <BranchStatusCard
+            commitMetadata={commitMetadata}
+            onCommit={props.onCommit}
+            onCreatePullRequest={props.onCreatePullRequest}
+            pullRequestMetadata={pullRequestMetadata}
+            task={task}
+            taskDiff={props.taskDiff}
+          />
+        </div>
+      </TaskSection>
+
       <TaskSection title="Approval history">
         <div className="detail-card detail-card-stack">
           <TaskApprovals approvals={approvals} />
@@ -249,6 +290,129 @@ function TaskDetailContent(props: { taskDetail: TaskDetail }) {
         </div>
       </TaskSection>
     </div>
+  );
+}
+
+function BranchStatusCard(props: {
+  commitMetadata: {
+    branch_name?: string;
+    committed_at?: string;
+    message?: string;
+    sha?: string;
+  } | null;
+  onCommit: (taskId: string, message?: string) => Promise<void>;
+  onCreatePullRequest: (taskId: string) => Promise<void>;
+  pullRequestMetadata: {
+    base_branch?: string;
+    body?: string;
+    compare_url?: string | null;
+    head_branch?: string;
+    head_sha?: string;
+    status?: string;
+    title?: string;
+  } | null;
+  task: TaskDetail["task"];
+  taskDiff: TaskDiff | null;
+}) {
+  if (!props.task.branch_name) {
+    return <p className="empty-state">This task does not use a dedicated task branch.</p>;
+  }
+
+  return (
+    <>
+      <div className="detail-grid">
+        <div>
+          <dt>Task branch</dt>
+          <dd>{props.task.branch_name}</dd>
+        </div>
+        <div>
+          <dt>Current branch</dt>
+          <dd>{props.taskDiff?.current_branch ?? "Unknown"}</dd>
+        </div>
+        <div>
+          <dt>Base branch</dt>
+          <dd>{props.taskDiff?.base_branch ?? "Unknown"}</dd>
+        </div>
+        <div>
+          <dt>Head commit</dt>
+          <dd>{props.taskDiff?.head_sha ?? "Unknown"}</dd>
+        </div>
+        <div>
+          <dt>Ahead / behind</dt>
+          <dd>
+            {(props.taskDiff?.ahead_by ?? 0) +
+              " ahead / " +
+              (props.taskDiff?.behind_by ?? 0) +
+              " behind"}
+          </dd>
+        </div>
+        <div>
+          <dt>Working tree</dt>
+          <dd>{props.taskDiff?.has_changes ? "Uncommitted changes" : "Clean"}</dd>
+        </div>
+      </div>
+
+      {props.commitMetadata ? (
+        <div className="routing-callout">
+          <p className="eyebrow">Latest commit</p>
+          <p>
+            {(props.commitMetadata.sha ?? "unknown") +
+              " · " +
+              (props.commitMetadata.message ?? "No commit message stored")}
+          </p>
+        </div>
+      ) : null}
+
+      {props.pullRequestMetadata ? (
+        <div className="routing-callout">
+          <p className="eyebrow">Pull request draft</p>
+          <p>{props.pullRequestMetadata.title ?? "PR draft prepared"}</p>
+          {props.pullRequestMetadata.compare_url ? (
+            <a
+              className="ghost-button action-link"
+              href={props.pullRequestMetadata.compare_url}
+              rel="noreferrer"
+              target="_blank"
+            >
+              Open compare view
+            </a>
+          ) : null}
+        </div>
+      ) : null}
+
+      <form
+        className="task-action-row"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const formData = new FormData(event.currentTarget);
+          const message = formData.get("commit_message");
+
+          void props.onCommit(props.task.id, typeof message === "string" ? message : undefined);
+        }}
+      >
+        <input
+          defaultValue={props.commitMetadata?.message ?? `Task: ${props.task.title}`}
+          name="commit_message"
+          placeholder="Commit message"
+        />
+        <button className="solid-button" type="submit">
+          Commit changes
+        </button>
+        <button
+          className="ghost-button"
+          onClick={() => void props.onCreatePullRequest(props.task.id)}
+          type="button"
+        >
+          Create PR draft
+        </button>
+      </form>
+
+      <ChangedFilesCard files={props.taskDiff?.changed_files ?? []} />
+      <DiffPatchCard
+        diffStat={props.taskDiff?.diff_stat ?? ""}
+        patch={props.taskDiff?.patch ?? ""}
+      />
+    </>
   );
 }
 
@@ -276,6 +440,23 @@ function ChangedFilesCard(props: { files: Array<{ path: string; status: string }
           <span className="chip chip-soft">{file.status}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function DiffPatchCard(props: { diffStat: string; patch: string }) {
+  if (!props.diffStat && !props.patch) {
+    return <p className="empty-state">No live diff is available for this task branch right now.</p>;
+  }
+
+  return (
+    <div className="artifact-list">
+      {props.diffStat ? <p>{props.diffStat}</p> : null}
+      {props.patch ? (
+        <pre className="command-preview diff-preview">
+          <code>{props.patch}</code>
+        </pre>
+      ) : null}
     </div>
   );
 }

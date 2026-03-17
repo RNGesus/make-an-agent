@@ -588,6 +588,243 @@ test("risky bash approvals require a scope and resume the task after approval", 
   expect(executionCount).toBe(2);
 });
 
+test("write tasks create a task branch and expose a live diff endpoint", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-lambda");
+  const app = createApp(workspaceRoot, {
+    piExecute(envelope) {
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-lambda\nTask branch output\n");
+
+      return {
+        final_answer: `Stub ${envelope.mode.toUpperCase()} pi session for '${envelope.task_title}' completed.`,
+        session_id: `pi-${envelope.mode}:${envelope.task_id}`,
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+
+  const createResponse = await app.handleRequest(
+    new Request("http://localhost/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repo_id: repoId,
+        title: "Implement branch capture",
+        user_prompt: "Implement the requested server change",
+        goal_type: "implement",
+      }),
+    }),
+  );
+  const created = (await createResponse.json()) as {
+    task: { id: string };
+    approvals: Array<{ id: string }>;
+  };
+
+  const approveResponse = await app.handleRequest(
+    new Request(`http://localhost/api/approvals/${created.approvals[0]?.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  const approved = (await approveResponse.json()) as {
+    task: { task: { branch_name: string | null; status: string } };
+  };
+
+  expect(approveResponse.status).toBe(200);
+  expect(approved.task.task.status).toBe("completed");
+  expect(approved.task.task.branch_name).toContain("task/");
+
+  const diffResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${created.task.id}/diff`),
+  );
+  const diff = (await diffResponse.json()) as {
+    branch_name: string | null;
+    changed_files: Array<{ path: string; status: string }>;
+    current_branch: string | null;
+    has_changes: boolean;
+    patch: string;
+  };
+
+  expect(diffResponse.status).toBe(200);
+  expect(diff.branch_name).toBe(approved.task.task.branch_name);
+  expect(diff.current_branch).toBe(approved.task.task.branch_name);
+  expect(diff.has_changes).toBe(true);
+  expect(diff.changed_files).toEqual([{ path: "README.md", status: "M" }]);
+  expect(diff.patch).toContain("Task branch output");
+});
+
+test("commit requests can require approval and execute after approval", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-mu");
+  const app = createApp(workspaceRoot, {
+    piExecute(envelope) {
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-mu\nCommitted after approval\n");
+
+      return {
+        final_answer: `Stub ${envelope.mode.toUpperCase()} pi session for '${envelope.task_title}' completed.`,
+        session_id: `pi-${envelope.mode}:${envelope.task_id}`,
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+
+  await updatePolicy(app, repoId, { autonomy_mode: "approve-commits" });
+
+  const createResponse = await app.handleRequest(
+    new Request("http://localhost/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repo_id: repoId,
+        title: "Implement commit approvals",
+        user_prompt: "Implement the requested repository change",
+        goal_type: "implement",
+      }),
+    }),
+  );
+  const created = (await createResponse.json()) as {
+    task: { id: string };
+    approvals: Array<{ id: string }>;
+  };
+
+  await app.handleRequest(
+    new Request(`http://localhost/api/approvals/${created.approvals[0]?.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+  );
+
+  const commitResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${created.task.id}/commit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Commit generated task changes" }),
+    }),
+  );
+  const commitRequested = (await commitResponse.json()) as {
+    approval: { id: string; approval_type: string; status: string } | null;
+    task: { task: { status: string } };
+  };
+
+  expect(commitResponse.status).toBe(200);
+  expect(commitRequested.approval).toMatchObject({
+    approval_type: "commit",
+    status: "pending",
+  });
+  expect(commitRequested.task.task.status).toBe("completed");
+
+  const approveCommitResponse = await app.handleRequest(
+    new Request(`http://localhost/api/approvals/${commitRequested.approval?.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  const approvedCommit = (await approveCommitResponse.json()) as {
+    approval: { status: string };
+    task: {
+      artifacts: Array<{ artifact_type: string; payload_json: string }>;
+      task: { status: string };
+    };
+  };
+
+  expect(approveCommitResponse.status).toBe(200);
+  expect(approvedCommit.approval.status).toBe("approved");
+  expect(approvedCommit.task.task.status).toBe("completed");
+  expect(
+    approvedCommit.task.artifacts.find((artifact) => artifact.artifact_type === "commit_metadata"),
+  ).toBeTruthy();
+
+  const diffResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${created.task.id}/diff`),
+  );
+  const diff = (await diffResponse.json()) as { has_changes: boolean };
+
+  expect(diffResponse.status).toBe(200);
+  expect(diff.has_changes).toBe(false);
+});
+
+test("trusted task branches can prepare a pull request draft after commit", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-nu");
+  const app = createApp(workspaceRoot, {
+    piExecute(envelope) {
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-nu\nReady for PR draft\n");
+
+      return {
+        final_answer: `Stub ${envelope.mode.toUpperCase()} pi session for '${envelope.task_title}' completed.`,
+        session_id: `pi-${envelope.mode}:${envelope.task_id}`,
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+
+  await updatePolicy(app, repoId, { autonomy_mode: "trusted" });
+
+  const createResponse = await app.handleRequest(
+    new Request("http://localhost/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repo_id: repoId,
+        title: "Implement PR drafting",
+        user_prompt: "Implement the requested repository change",
+        goal_type: "implement",
+      }),
+    }),
+  );
+  const created = (await createResponse.json()) as {
+    task: { id: string; status: string };
+  };
+
+  expect(createResponse.status).toBe(201);
+  expect(created.task.status).toBe("completed");
+
+  const commitResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${created.task.id}/commit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Commit trusted task changes" }),
+    }),
+  );
+  const committed = (await commitResponse.json()) as {
+    approval: null;
+    task: { artifacts: Array<{ artifact_type: string }> };
+  };
+
+  expect(commitResponse.status).toBe(200);
+  expect(committed.approval).toBeNull();
+  expect(committed.task.artifacts.map((artifact) => artifact.artifact_type)).toContain(
+    "commit_metadata",
+  );
+
+  const prResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${created.task.id}/pr`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+  );
+  const drafted = (await prResponse.json()) as {
+    approval: null;
+    task: { artifacts: Array<{ artifact_type: string; payload_json: string }> };
+  };
+
+  expect(prResponse.status).toBe(200);
+  expect(drafted.approval).toBeNull();
+  expect(
+    drafted.task.artifacts.find((artifact) => artifact.artifact_type === "pr_metadata"),
+  ).toBeTruthy();
+  expect(
+    JSON.parse(
+      drafted.task.artifacts.find((artifact) => artifact.artifact_type === "pr_metadata")
+        ?.payload_json ?? "{}",
+    ),
+  ).toMatchObject({
+    status: "drafted",
+    title: "Implement PR drafting",
+  });
+});
+
 test("task creation rejects unknown repositories", async () => {
   const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
   const app = createApp(workspaceRoot);
@@ -635,6 +872,24 @@ async function registerRepository(app: ReturnType<typeof createServerApp>, repoR
   const payload = (await response.json()) as { repository: { id: string } };
 
   return payload.repository.id;
+}
+
+async function updatePolicy(
+  app: ReturnType<typeof createServerApp>,
+  repoId: string,
+  patch: Record<string, unknown>,
+) {
+  const response = await app.handleRequest(
+    new Request(`http://localhost/api/repos/${repoId}/policy`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+  );
+
+  if (response.status !== 200) {
+    throw new Error(`Failed to patch repository policy for ${repoId}.`);
+  }
 }
 
 function createStubPiExecutor(): PiExecutor {

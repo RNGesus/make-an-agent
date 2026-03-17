@@ -8,161 +8,163 @@
 // You should NOT make any changes in this file as it will be overwritten.
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
-import { Route as rootRouteImport } from "./routes/__root";
-import { Route as IndexRouteImport } from "./routes/index";
-import { Route as ReposIndexRouteImport } from "./routes/repos/index";
-import { Route as ApprovalsIndexRouteImport } from "./routes/approvals/index";
-import { Route as ReposRepoIdRouteImport } from "./routes/repos/$repoId";
-import { Route as ApprovalsApprovalIdRouteImport } from "./routes/approvals/$approvalId";
-import { Route as ReposRepoIdTasksTaskIdRouteImport } from "./routes/repos/$repoId/tasks/$taskId";
+import { Route as rootRouteImport } from './routes/__root'
+import { Route as IndexRouteImport } from './routes/index'
+import { Route as ReposIndexRouteImport } from './routes/repos/index'
+import { Route as ApprovalsIndexRouteImport } from './routes/approvals/index'
+import { Route as ReposRepoIdRouteImport } from './routes/repos/$repoId'
+import { Route as ApprovalsApprovalIdRouteImport } from './routes/approvals/$approvalId'
+import { Route as ReposRepoIdTasksTaskIdRouteImport } from './routes/repos/$repoId/tasks/$taskId'
 
 const IndexRoute = IndexRouteImport.update({
-  id: "/",
-  path: "/",
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const ReposIndexRoute = ReposIndexRouteImport.update({
-  id: "/repos/",
-  path: "/repos/",
+  id: '/repos/',
+  path: '/repos/',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const ApprovalsIndexRoute = ApprovalsIndexRouteImport.update({
-  id: "/approvals/",
-  path: "/approvals/",
+  id: '/approvals/',
+  path: '/approvals/',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const ReposRepoIdRoute = ReposRepoIdRouteImport.update({
-  id: "/repos/$repoId",
-  path: "/repos/$repoId",
+  id: '/repos/$repoId',
+  path: '/repos/$repoId',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const ApprovalsApprovalIdRoute = ApprovalsApprovalIdRouteImport.update({
-  id: "/approvals/$approvalId",
-  path: "/approvals/$approvalId",
+  id: '/approvals/$approvalId',
+  path: '/approvals/$approvalId',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const ReposRepoIdTasksTaskIdRoute = ReposRepoIdTasksTaskIdRouteImport.update({
-  id: "/tasks/$taskId",
-  path: "/tasks/$taskId",
+  id: '/tasks/$taskId',
+  path: '/tasks/$taskId',
   getParentRoute: () => ReposRepoIdRoute,
-} as any);
+} as any)
 
 export interface FileRoutesByFullPath {
-  "/": typeof IndexRoute;
-  "/approvals/$approvalId": typeof ApprovalsApprovalIdRoute;
-  "/repos/$repoId": typeof ReposRepoIdRouteWithChildren;
-  "/approvals/": typeof ApprovalsIndexRoute;
-  "/repos/": typeof ReposIndexRoute;
-  "/repos/$repoId/tasks/$taskId": typeof ReposRepoIdTasksTaskIdRoute;
+  '/': typeof IndexRoute
+  '/approvals/$approvalId': typeof ApprovalsApprovalIdRoute
+  '/repos/$repoId': typeof ReposRepoIdRouteWithChildren
+  '/approvals/': typeof ApprovalsIndexRoute
+  '/repos/': typeof ReposIndexRoute
+  '/repos/$repoId/tasks/$taskId': typeof ReposRepoIdTasksTaskIdRoute
 }
 export interface FileRoutesByTo {
-  "/": typeof IndexRoute;
-  "/approvals/$approvalId": typeof ApprovalsApprovalIdRoute;
-  "/repos/$repoId": typeof ReposRepoIdRouteWithChildren;
-  "/approvals": typeof ApprovalsIndexRoute;
-  "/repos": typeof ReposIndexRoute;
-  "/repos/$repoId/tasks/$taskId": typeof ReposRepoIdTasksTaskIdRoute;
+  '/': typeof IndexRoute
+  '/approvals/$approvalId': typeof ApprovalsApprovalIdRoute
+  '/repos/$repoId': typeof ReposRepoIdRouteWithChildren
+  '/approvals': typeof ApprovalsIndexRoute
+  '/repos': typeof ReposIndexRoute
+  '/repos/$repoId/tasks/$taskId': typeof ReposRepoIdTasksTaskIdRoute
 }
 export interface FileRoutesById {
-  __root__: typeof rootRouteImport;
-  "/": typeof IndexRoute;
-  "/approvals/$approvalId": typeof ApprovalsApprovalIdRoute;
-  "/repos/$repoId": typeof ReposRepoIdRouteWithChildren;
-  "/approvals/": typeof ApprovalsIndexRoute;
-  "/repos/": typeof ReposIndexRoute;
-  "/repos/$repoId/tasks/$taskId": typeof ReposRepoIdTasksTaskIdRoute;
+  __root__: typeof rootRouteImport
+  '/': typeof IndexRoute
+  '/approvals/$approvalId': typeof ApprovalsApprovalIdRoute
+  '/repos/$repoId': typeof ReposRepoIdRouteWithChildren
+  '/approvals/': typeof ApprovalsIndexRoute
+  '/repos/': typeof ReposIndexRoute
+  '/repos/$repoId/tasks/$taskId': typeof ReposRepoIdTasksTaskIdRoute
 }
 export interface FileRouteTypes {
-  fileRoutesByFullPath: FileRoutesByFullPath;
+  fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    | "/"
-    | "/approvals/$approvalId"
-    | "/repos/$repoId"
-    | "/approvals/"
-    | "/repos/"
-    | "/repos/$repoId/tasks/$taskId";
-  fileRoutesByTo: FileRoutesByTo;
+    | '/'
+    | '/approvals/$approvalId'
+    | '/repos/$repoId'
+    | '/approvals/'
+    | '/repos/'
+    | '/repos/$repoId/tasks/$taskId'
+  fileRoutesByTo: FileRoutesByTo
   to:
-    | "/"
-    | "/approvals/$approvalId"
-    | "/repos/$repoId"
-    | "/approvals"
-    | "/repos"
-    | "/repos/$repoId/tasks/$taskId";
+    | '/'
+    | '/approvals/$approvalId'
+    | '/repos/$repoId'
+    | '/approvals'
+    | '/repos'
+    | '/repos/$repoId/tasks/$taskId'
   id:
-    | "__root__"
-    | "/"
-    | "/approvals/$approvalId"
-    | "/repos/$repoId"
-    | "/approvals/"
-    | "/repos/"
-    | "/repos/$repoId/tasks/$taskId";
-  fileRoutesById: FileRoutesById;
+    | '__root__'
+    | '/'
+    | '/approvals/$approvalId'
+    | '/repos/$repoId'
+    | '/approvals/'
+    | '/repos/'
+    | '/repos/$repoId/tasks/$taskId'
+  fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  IndexRoute: typeof IndexRoute;
-  ApprovalsApprovalIdRoute: typeof ApprovalsApprovalIdRoute;
-  ReposRepoIdRoute: typeof ReposRepoIdRouteWithChildren;
-  ApprovalsIndexRoute: typeof ApprovalsIndexRoute;
-  ReposIndexRoute: typeof ReposIndexRoute;
+  IndexRoute: typeof IndexRoute
+  ApprovalsApprovalIdRoute: typeof ApprovalsApprovalIdRoute
+  ReposRepoIdRoute: typeof ReposRepoIdRouteWithChildren
+  ApprovalsIndexRoute: typeof ApprovalsIndexRoute
+  ReposIndexRoute: typeof ReposIndexRoute
 }
 
-declare module "@tanstack/react-router" {
+declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    "/": {
-      id: "/";
-      path: "/";
-      fullPath: "/";
-      preLoaderRoute: typeof IndexRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/repos/": {
-      id: "/repos/";
-      path: "/repos";
-      fullPath: "/repos/";
-      preLoaderRoute: typeof ReposIndexRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/approvals/": {
-      id: "/approvals/";
-      path: "/approvals";
-      fullPath: "/approvals/";
-      preLoaderRoute: typeof ApprovalsIndexRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/repos/$repoId": {
-      id: "/repos/$repoId";
-      path: "/repos/$repoId";
-      fullPath: "/repos/$repoId";
-      preLoaderRoute: typeof ReposRepoIdRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/approvals/$approvalId": {
-      id: "/approvals/$approvalId";
-      path: "/approvals/$approvalId";
-      fullPath: "/approvals/$approvalId";
-      preLoaderRoute: typeof ApprovalsApprovalIdRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/repos/$repoId/tasks/$taskId": {
-      id: "/repos/$repoId/tasks/$taskId";
-      path: "/tasks/$taskId";
-      fullPath: "/repos/$repoId/tasks/$taskId";
-      preLoaderRoute: typeof ReposRepoIdTasksTaskIdRouteImport;
-      parentRoute: typeof ReposRepoIdRoute;
-    };
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/repos/': {
+      id: '/repos/'
+      path: '/repos'
+      fullPath: '/repos/'
+      preLoaderRoute: typeof ReposIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/approvals/': {
+      id: '/approvals/'
+      path: '/approvals'
+      fullPath: '/approvals/'
+      preLoaderRoute: typeof ApprovalsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/repos/$repoId': {
+      id: '/repos/$repoId'
+      path: '/repos/$repoId'
+      fullPath: '/repos/$repoId'
+      preLoaderRoute: typeof ReposRepoIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/approvals/$approvalId': {
+      id: '/approvals/$approvalId'
+      path: '/approvals/$approvalId'
+      fullPath: '/approvals/$approvalId'
+      preLoaderRoute: typeof ApprovalsApprovalIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/repos/$repoId/tasks/$taskId': {
+      id: '/repos/$repoId/tasks/$taskId'
+      path: '/tasks/$taskId'
+      fullPath: '/repos/$repoId/tasks/$taskId'
+      preLoaderRoute: typeof ReposRepoIdTasksTaskIdRouteImport
+      parentRoute: typeof ReposRepoIdRoute
+    }
   }
 }
 
 interface ReposRepoIdRouteChildren {
-  ReposRepoIdTasksTaskIdRoute: typeof ReposRepoIdTasksTaskIdRoute;
+  ReposRepoIdTasksTaskIdRoute: typeof ReposRepoIdTasksTaskIdRoute
 }
 
 const ReposRepoIdRouteChildren: ReposRepoIdRouteChildren = {
   ReposRepoIdTasksTaskIdRoute: ReposRepoIdTasksTaskIdRoute,
-};
+}
 
-const ReposRepoIdRouteWithChildren = ReposRepoIdRoute._addFileChildren(ReposRepoIdRouteChildren);
+const ReposRepoIdRouteWithChildren = ReposRepoIdRoute._addFileChildren(
+  ReposRepoIdRouteChildren,
+)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
@@ -170,16 +172,16 @@ const rootRouteChildren: RootRouteChildren = {
   ReposRepoIdRoute: ReposRepoIdRouteWithChildren,
   ApprovalsIndexRoute: ApprovalsIndexRoute,
   ReposIndexRoute: ReposIndexRoute,
-};
+}
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
-  ._addFileTypes<FileRouteTypes>();
+  ._addFileTypes<FileRouteTypes>()
 
-import type { getRouter } from "./router.tsx";
-import type { createStart } from "@tanstack/react-start";
-declare module "@tanstack/react-start" {
+import type { getRouter } from './router.tsx'
+import type { createStart } from '@tanstack/react-start'
+declare module '@tanstack/react-start' {
   interface Register {
-    ssr: true;
-    router: Awaited<ReturnType<typeof getRouter>>;
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
   }
 }

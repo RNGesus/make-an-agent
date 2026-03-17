@@ -12,6 +12,7 @@ export const taskStatuses = [
 export const routingTiers = ["cheap", "strong"] as const;
 export const artifactTypes = [
   "changed_files",
+  "commit_metadata",
   "diff_summary",
   "final_answer",
   "pr_metadata",

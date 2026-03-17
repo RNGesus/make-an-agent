@@ -807,6 +807,42 @@ export function replaceTaskArtifacts(
     return;
   }
 
+  insertTaskArtifacts(database, taskId, artifacts);
+}
+
+export function upsertTaskArtifacts(
+  database: DatabaseSync,
+  taskId: string,
+  artifacts: readonly TaskArtifactValues[],
+) {
+  if (artifacts.length === 0) {
+    return;
+  }
+
+  const artifactBindings = Object.fromEntries(
+    artifacts.map((artifact, index) => [`artifact_type_${index}`, artifact.artifact_type]),
+  );
+  const placeholders = artifacts.map((_, index) => `:artifact_type_${index}`).join(", ");
+
+  database
+    .prepare(
+      `DELETE FROM task_artifacts
+       WHERE task_id = :taskId
+         AND artifact_type IN (${placeholders})`,
+    )
+    .run({
+      taskId,
+      ...artifactBindings,
+    });
+
+  insertTaskArtifacts(database, taskId, artifacts);
+}
+
+function insertTaskArtifacts(
+  database: DatabaseSync,
+  taskId: string,
+  artifacts: readonly TaskArtifactValues[],
+) {
   const insert = database.prepare(
     `INSERT INTO task_artifacts (
       id,

@@ -485,6 +485,13 @@ label span {
   gap: 10px;
 }
 
+.task-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+}
+
 .detail-prompt {
   padding: 16px 18px;
   border-radius: 22px;
@@ -559,6 +566,14 @@ code {
   overflow-x: auto;
 }
 
+.diff-preview {
+  max-height: 26rem;
+}
+
+.action-link {
+  width: fit-content;
+}
+
 @keyframes float {
   0%,
   100% {
@@ -604,7 +619,8 @@ code {
   .two-up,
   .four-up,
   .detail-grid,
-  .stat-strip {
+  .stat-strip,
+  .task-action-row {
     grid-template-columns: 1fr;
   }
 
