@@ -15,6 +15,7 @@ test("dirty files modified again during execution are still attributed to the ta
   const result = await executePiTask(
     {
       mode: "rpc",
+      execution_key: "task-1:2026-03-17T10:00:00.000Z",
       repo: {
         id: "repo-1",
         name: "runner-alpha",

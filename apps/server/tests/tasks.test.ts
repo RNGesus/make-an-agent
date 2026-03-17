@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, expect, test } from "vite-plus/test";
-import type { PiExecutor } from "pi-runner";
+import { PiCommandApprovalRequiredError, type PiExecutor } from "pi-runner";
 import { createServerApp } from "../src/app.ts";
 
 const apps: Array<ReturnType<typeof createServerApp>> = [];
@@ -503,6 +503,89 @@ test("read-only execution does not attribute pre-existing dirty changes to the t
   expect(
     created.artifacts.find((artifact) => artifact.artifact_type === "diff_summary")?.summary,
   ).toContain("already dirty before execution");
+});
+
+test("risky bash approvals require a scope and resume the task after approval", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-kappa");
+  let executionCount = 0;
+  let registeredRepoId = "";
+  const app = createApp(workspaceRoot, {
+    piExecute(envelope) {
+      executionCount += 1;
+
+      if (executionCount === 1) {
+        throw new PiCommandApprovalRequiredError("Allow the risky bash command for this task.", {
+          repo_id: registeredRepoId,
+          repo_name: envelope.repo_name,
+          task_id: envelope.task_id,
+          task_title: envelope.task_title,
+          goal_type: envelope.task_goal_type,
+          routing_tier: envelope.routing_tier,
+          command: "git push origin HEAD",
+          command_fingerprint: "fingerprint-1",
+          session_key: envelope.execution_key,
+        });
+      }
+
+      return {
+        final_answer: `Stub ${envelope.mode.toUpperCase()} pi session for '${envelope.task_title}' completed.`,
+        session_id: `pi-${envelope.mode}:${envelope.task_id}`,
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+  registeredRepoId = repoId;
+
+  const createResponse = await app.handleRequest(
+    new Request("http://localhost/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repo_id: repoId,
+        user_prompt: "Inspect the branch and report the current status",
+        goal_type: "question",
+      }),
+    }),
+  );
+  const created = (await createResponse.json()) as {
+    task: { status: string };
+    approvals: Array<{ id: string; approval_type: string; status: string }>;
+  };
+
+  expect(createResponse.status).toBe(201);
+  expect(created.task.status).toBe("awaiting_approval");
+  expect(created.approvals[0]).toMatchObject({ approval_type: "risky_bash", status: "pending" });
+
+  const missingScopeResponse = await app.handleRequest(
+    new Request(`http://localhost/api/approvals/${created.approvals[0]?.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+  );
+  const missingScopePayload = (await missingScopeResponse.json()) as { error: string };
+
+  expect(missingScopeResponse.status).toBe(400);
+  expect(missingScopePayload.error).toContain("require a scope");
+
+  const approveResponse = await app.handleRequest(
+    new Request(`http://localhost/api/approvals/${created.approvals[0]?.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scope: "session" }),
+    }),
+  );
+  const approved = (await approveResponse.json()) as {
+    approval: { status: string; resolution_payload_json: string };
+    task: { task: { status: string } };
+  };
+
+  expect(approveResponse.status).toBe(200);
+  expect(approved.approval.status).toBe("approved");
+  expect(JSON.parse(approved.approval.resolution_payload_json)).toEqual({ scope: "session" });
+  expect(approved.task.task.status).toBe("completed");
+  expect(executionCount).toBe(2);
 });
 
 test("task creation rejects unknown repositories", async () => {

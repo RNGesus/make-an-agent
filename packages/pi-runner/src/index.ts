@@ -14,6 +14,7 @@ import {
   createWriteTool,
 } from "@mariozechner/pi-coding-agent";
 import type {
+  ApprovalScope,
   ArtifactType,
   RepositoryPolicyRecord,
   RepositoryRecord,
@@ -39,6 +40,7 @@ interface GitSnapshot {
 
 export interface PiExecutionRequest {
   mode: PiRunnerMode;
+  execution_key: string;
   repo: Pick<RepositoryRecord, "id" | "name" | "root_path" | "default_branch">;
   policy: Pick<
     RepositoryPolicyRecord,
@@ -60,6 +62,7 @@ export interface PiExecutionRequest {
 
 export interface PiExecutionEnvelope {
   mode: PiRunnerMode;
+  execution_key: string;
   session_key: string;
   workspace_root: string;
   allow_read: boolean;
@@ -105,9 +108,27 @@ export type PiExecutor = (
   envelope: PiExecutionEnvelope,
 ) => PiExecutorOutput | Promise<PiExecutorOutput>;
 
+export interface PiBashAuthorizationContext {
+  envelope: PiExecutionEnvelope;
+  command: string;
+  timeout?: number;
+}
+
+export type PiBashAuthorizationDecision =
+  | { status: "allow"; scope?: ApprovalScope | null }
+  | { status: "deny"; reason: string }
+  | {
+      status: "require_approval";
+      requested_action: string;
+      payload: Record<string, unknown>;
+    };
+
 export interface PiRunnerRuntime {
   execute?: PiExecutor;
   now?: () => Date;
+  authorizeBashCommand?: (
+    context: PiBashAuthorizationContext,
+  ) => PiBashAuthorizationDecision | Promise<PiBashAuthorizationDecision>;
 }
 
 interface PiSessionState {
@@ -115,10 +136,34 @@ interface PiSessionState {
   session_file: string | null;
 }
 
+export class PiCommandApprovalRequiredError extends Error {
+  readonly approval_type = "risky_bash" as const;
+  readonly requested_action: string;
+  readonly requested_payload: Record<string, unknown>;
+
+  constructor(requestedAction: string, requestedPayload: Record<string, unknown>) {
+    super(requestedAction);
+    this.name = "PiCommandApprovalRequiredError";
+    this.requested_action = requestedAction;
+    this.requested_payload = requestedPayload;
+  }
+}
+
+export class PiExecutionBlockedError extends Error {
+  readonly action: "bash";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "PiExecutionBlockedError";
+    this.action = "bash";
+  }
+}
+
 export function createPiExecutionEnvelope(request: PiExecutionRequest): PiExecutionEnvelope {
   return {
     mode: request.mode,
-    session_key: `${request.repo.id}:${request.task.id}`,
+    execution_key: request.execution_key,
+    session_key: request.execution_key,
     workspace_root: request.policy.allowed_root,
     allow_read: request.policy.allow_read,
     allow_edit: request.policy.allow_edit,
@@ -144,15 +189,16 @@ export async function executePiTask(
   runtime: PiRunnerRuntime = {},
 ): Promise<PiExecutionResult> {
   const envelope = createPiExecutionEnvelope(request);
-  const executor = runtime.execute ?? livePiExecutor;
   const beforeGitArtifacts = captureGitArtifacts(envelope.workspace_root);
-  const execution = await executor(envelope);
+  const execution = runtime.execute
+    ? await runtime.execute(envelope)
+    : await livePiExecutor(envelope, runtime);
   const afterGitArtifacts = captureGitArtifacts(envelope.workspace_root);
   const gitArtifacts = summarizeGitDelta(beforeGitArtifacts, afterGitArtifacts);
   const finalAnswer = execution.final_answer.trim();
   const sessionId = execution.session_id ?? `pi-${request.mode}:${randomUUID()}`;
   const notes = [
-    `Execution mode: ${request.mode}.`,
+    `Requested execution mode: ${request.mode}.`,
     `Selected model: ${request.model_profile.provider}/${request.model_profile.model}.`,
     `Workspace root: ${envelope.workspace_root}.`,
     `Routing tier: ${request.routing_tier}.`,
@@ -211,16 +257,26 @@ export async function executePiTask(
   };
 }
 
-async function livePiExecutor(envelope: PiExecutionEnvelope): Promise<PiExecutorOutput> {
-  return envelope.mode === "sdk" ? executeWithSdk(envelope) : executeWithRpc(envelope);
+async function livePiExecutor(
+  envelope: PiExecutionEnvelope,
+  runtime: PiRunnerRuntime = {},
+): Promise<PiExecutorOutput> {
+  if (envelope.mode === "rpc") {
+    return executeWithRpc(envelope, runtime);
+  }
+
+  return executeWithSdk(envelope, runtime);
 }
 
-async function executeWithSdk(envelope: PiExecutionEnvelope): Promise<PiExecutorOutput> {
+async function executeWithSdk(
+  envelope: PiExecutionEnvelope,
+  runtime: PiRunnerRuntime = {},
+): Promise<PiExecutorOutput> {
   const sessionState = createPiSessionState(envelope.workspace_root);
   const { session } = await createAgentSession({
     cwd: envelope.workspace_root,
     sessionManager: SessionManager.open(sessionState.session_file ?? ""),
-    tools: createPiTools(envelope),
+    tools: createPiTools(envelope, runtime),
   });
   const selectedModel = session.modelRegistry.find(envelope.provider, envelope.model);
 
@@ -254,7 +310,26 @@ async function executeWithSdk(envelope: PiExecutionEnvelope): Promise<PiExecutor
   }
 }
 
-async function executeWithRpc(envelope: PiExecutionEnvelope): Promise<PiExecutorOutput> {
+async function executeWithRpc(
+  envelope: PiExecutionEnvelope,
+  runtime: PiRunnerRuntime = {},
+): Promise<PiExecutorOutput> {
+  if (
+    runtime.authorizeBashCommand &&
+    envelope.allow_bash &&
+    envelope.approval_required_for_risky_bash
+  ) {
+    const execution = await executeWithSdk(envelope, runtime);
+
+    return {
+      ...execution,
+      execution_notes: [
+        "Requested RPC mode but executed through the SDK to enforce per-command bash approvals.",
+        ...(execution.execution_notes ?? []),
+      ],
+    };
+  }
+
   const sessionState = createPiSessionState(envelope.workspace_root);
   const prompt = buildPiTaskPrompt(envelope);
   const args = [
@@ -297,9 +372,11 @@ function createPiSessionState(workspaceRoot: string): PiSessionState {
   };
 }
 
-function createPiTools(envelope: PiExecutionEnvelope) {
+function createPiTools(envelope: PiExecutionEnvelope, runtime: PiRunnerRuntime) {
   const tools = [];
-  const allowBashTools = envelope.allow_bash && !envelope.approval_required_for_risky_bash;
+  const allowBashTools =
+    envelope.allow_bash &&
+    (!envelope.approval_required_for_risky_bash || Boolean(runtime.authorizeBashCommand));
   const allowEditTools =
     envelope.allow_edit &&
     envelope.task_goal_type !== "question" &&
@@ -315,7 +392,7 @@ function createPiTools(envelope: PiExecutionEnvelope) {
   }
 
   if (allowBashTools) {
-    tools.push(createBashTool(envelope.workspace_root));
+    tools.push(createGuardedBashTool(envelope, runtime));
   }
 
   if (allowEditTools) {
@@ -323,6 +400,36 @@ function createPiTools(envelope: PiExecutionEnvelope) {
   }
 
   return tools;
+}
+
+function createGuardedBashTool(envelope: PiExecutionEnvelope, runtime: PiRunnerRuntime) {
+  const bashTool = createBashTool(envelope.workspace_root);
+
+  if (!runtime.authorizeBashCommand) {
+    return bashTool;
+  }
+
+  return {
+    ...bashTool,
+    execute: async (...args: Parameters<typeof bashTool.execute>) => {
+      const [, input] = args;
+      const decision = await runtime.authorizeBashCommand?.({
+        envelope,
+        command: input.command,
+        timeout: input.timeout,
+      });
+
+      if (!decision || decision.status === "allow") {
+        return bashTool.execute(...args);
+      }
+
+      if (decision.status === "deny") {
+        throw new PiExecutionBlockedError(decision.reason);
+      }
+
+      throw new PiCommandApprovalRequiredError(decision.requested_action, decision.payload);
+    },
+  };
 }
 
 function buildRpcToolsArgument(envelope: PiExecutionEnvelope) {

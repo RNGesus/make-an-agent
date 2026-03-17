@@ -6,10 +6,12 @@ import type {
   ArtifactType,
   AuditEventRecord,
   ApprovalRecord,
+  ApprovalScope,
   ApprovalStatus,
   ApprovalType,
   RepositoryPolicyRecord,
   RepositoryRecord,
+  RiskyBashGrantRecord,
   TaskArtifactRecord,
   TaskGoalType,
   TaskRecord,
@@ -108,9 +110,24 @@ interface ApprovalRow {
   approval_type: ApprovalType;
   requested_action: string;
   requested_payload_json: string;
+  resolution_payload_json: string;
   status: ApprovalStatus;
   decided_by: string | null;
   decided_at: string | null;
+  created_at: string;
+}
+
+interface RiskyBashGrantRow {
+  id: string;
+  approval_id: string;
+  repo_id: string;
+  task_id: string | null;
+  session_key: string | null;
+  scope: ApprovalScope;
+  command: string;
+  command_fingerprint: string;
+  decided_by: string | null;
+  consumed_at: string | null;
   created_at: string;
 }
 
@@ -182,6 +199,25 @@ export interface ApprovalResolutionValues {
   status: Extract<ApprovalStatus, "approved" | "rejected">;
   decided_by: string | null;
   decided_at: string;
+  resolution_payload_json?: string;
+}
+
+export interface RiskyBashGrantValues {
+  approval_id: string;
+  repo_id: string;
+  task_id: string | null;
+  session_key: string | null;
+  scope: ApprovalScope;
+  command: string;
+  command_fingerprint: string;
+  decided_by: string | null;
+}
+
+export interface RiskyBashGrantLookup {
+  repo_id: string;
+  task_id: string;
+  session_key: string;
+  command_fingerprint: string;
 }
 
 export interface TaskExecutionValues {
@@ -209,6 +245,7 @@ export function applyConnectionPragmas(database: DatabaseSync) {
 
 export function applyInitialSchema(database: DatabaseSync) {
   database.exec(initialSchemaSql);
+  ensureApprovalResolutionPayloadColumn(database);
 }
 
 export function bootstrapControlPlaneDatabase(options: DatabaseBootstrapOptions) {
@@ -221,6 +258,18 @@ export function bootstrapControlPlaneDatabase(options: DatabaseBootstrapOptions)
   applyInitialSchema(database);
 
   return database;
+}
+
+function ensureApprovalResolutionPayloadColumn(database: DatabaseSync) {
+  const columns = database.prepare("PRAGMA table_info(approvals)").all() as Array<{ name: string }>;
+
+  if (columns.some((column) => column.name === "resolution_payload_json")) {
+    return;
+  }
+
+  database.exec(
+    "ALTER TABLE approvals ADD COLUMN resolution_payload_json TEXT NOT NULL DEFAULT '{}'",
+  );
 }
 
 export function listRepositories(database: DatabaseSync) {
@@ -535,6 +584,7 @@ export function listApprovals(database: DatabaseSync, status: ApprovalStatus = "
         approval_type,
         requested_action,
         requested_payload_json,
+        resolution_payload_json,
         status,
         decided_by,
         decided_at,
@@ -557,6 +607,7 @@ export function getApproval(database: DatabaseSync, approvalId: string) {
         approval_type,
         requested_action,
         requested_payload_json,
+        resolution_payload_json,
         status,
         decided_by,
         decided_at,
@@ -794,6 +845,7 @@ export function createApproval(database: DatabaseSync, values: ApprovalValues) {
         approval_type,
         requested_action,
         requested_payload_json,
+        resolution_payload_json,
         status,
         decided_by,
         decided_at
@@ -803,6 +855,7 @@ export function createApproval(database: DatabaseSync, values: ApprovalValues) {
         :approval_type,
         :requested_action,
         :requested_payload_json,
+        '{}',
         'pending',
         NULL,
         NULL
@@ -831,7 +884,8 @@ export function resolveApproval(
       `UPDATE approvals
        SET status = :status,
            decided_by = :decided_by,
-           decided_at = :decided_at
+           decided_at = :decided_at,
+           resolution_payload_json = :resolution_payload_json
        WHERE id = :id
          AND status = 'pending'`,
     )
@@ -840,6 +894,7 @@ export function resolveApproval(
       status: values.status,
       decided_by: values.decided_by,
       decided_at: values.decided_at,
+      resolution_payload_json: values.resolution_payload_json ?? "{}",
     });
 
   if (result.changes === 0) {
@@ -847,6 +902,183 @@ export function resolveApproval(
   }
 
   return getApproval(database, approvalId);
+}
+
+export function createRiskyBashGrant(database: DatabaseSync, values: RiskyBashGrantValues) {
+  const grantId = randomUUID();
+
+  database
+    .prepare(
+      `INSERT INTO risky_bash_grants (
+        id,
+        approval_id,
+        repo_id,
+        task_id,
+        session_key,
+        scope,
+        command,
+        command_fingerprint,
+        decided_by,
+        consumed_at
+      ) VALUES (
+        :id,
+        :approval_id,
+        :repo_id,
+        :task_id,
+        :session_key,
+        :scope,
+        :command,
+        :command_fingerprint,
+        :decided_by,
+        NULL
+      )`,
+    )
+    .run({
+      id: grantId,
+      approval_id: values.approval_id,
+      repo_id: values.repo_id,
+      task_id: values.task_id,
+      session_key: values.session_key,
+      scope: values.scope,
+      command: values.command,
+      command_fingerprint: values.command_fingerprint,
+      decided_by: values.decided_by,
+    });
+
+  return getRiskyBashGrant(database, grantId);
+}
+
+export function getRiskyBashGrant(database: DatabaseSync, grantId: string) {
+  const row = database
+    .prepare(
+      `SELECT
+        id,
+        approval_id,
+        repo_id,
+        task_id,
+        session_key,
+        scope,
+        command,
+        command_fingerprint,
+        decided_by,
+        consumed_at,
+        created_at
+      FROM risky_bash_grants
+      WHERE id = :grantId`,
+    )
+    .get({ grantId }) as unknown as RiskyBashGrantRow | undefined;
+
+  return row ? mapRiskyBashGrantRow(row) : null;
+}
+
+export function findReusableRiskyBashGrant(database: DatabaseSync, lookup: RiskyBashGrantLookup) {
+  const onceGrant = database
+    .prepare(
+      `SELECT
+        id,
+        approval_id,
+        repo_id,
+        task_id,
+        session_key,
+        scope,
+        command,
+        command_fingerprint,
+        decided_by,
+        consumed_at,
+        created_at
+      FROM risky_bash_grants
+      WHERE scope = 'once'
+        AND task_id = :task_id
+        AND session_key = :session_key
+        AND command_fingerprint = :command_fingerprint
+        AND consumed_at IS NULL
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+    )
+    .get({
+      task_id: lookup.task_id,
+      session_key: lookup.session_key,
+      command_fingerprint: lookup.command_fingerprint,
+    }) as unknown as RiskyBashGrantRow | undefined;
+
+  if (onceGrant) {
+    return mapRiskyBashGrantRow(onceGrant);
+  }
+
+  const sessionGrant = database
+    .prepare(
+      `SELECT
+        id,
+        approval_id,
+        repo_id,
+        task_id,
+        session_key,
+        scope,
+        command,
+        command_fingerprint,
+        decided_by,
+        consumed_at,
+        created_at
+      FROM risky_bash_grants
+      WHERE scope = 'session'
+        AND session_key = :session_key
+        AND command_fingerprint = :command_fingerprint
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+    )
+    .get({
+      session_key: lookup.session_key,
+      command_fingerprint: lookup.command_fingerprint,
+    }) as unknown as RiskyBashGrantRow | undefined;
+
+  if (sessionGrant) {
+    return mapRiskyBashGrantRow(sessionGrant);
+  }
+
+  const globalGrant = database
+    .prepare(
+      `SELECT
+        id,
+        approval_id,
+        repo_id,
+        task_id,
+        session_key,
+        scope,
+        command,
+        command_fingerprint,
+        decided_by,
+        consumed_at,
+        created_at
+      FROM risky_bash_grants
+      WHERE scope = 'global'
+        AND repo_id = :repo_id
+        AND command_fingerprint = :command_fingerprint
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+    )
+    .get({
+      repo_id: lookup.repo_id,
+      command_fingerprint: lookup.command_fingerprint,
+    }) as unknown as RiskyBashGrantRow | undefined;
+
+  return globalGrant ? mapRiskyBashGrantRow(globalGrant) : null;
+}
+
+export function consumeRiskyBashGrant(database: DatabaseSync, grantId: string, consumedAt: string) {
+  const result = database
+    .prepare(
+      `UPDATE risky_bash_grants
+       SET consumed_at = :consumed_at
+       WHERE id = :id
+         AND scope = 'once'
+         AND consumed_at IS NULL`,
+    )
+    .run({
+      id: grantId,
+      consumed_at: consumedAt,
+    });
+
+  return result.changes > 0;
 }
 
 export function getPendingTaskApproval(
@@ -862,6 +1094,7 @@ export function getPendingTaskApproval(
         approval_type,
         requested_action,
         requested_payload_json,
+        resolution_payload_json,
         status,
         decided_by,
         decided_at,
@@ -893,6 +1126,7 @@ export function getLatestApprovedTaskApproval(
         approval_type,
         requested_action,
         requested_payload_json,
+        resolution_payload_json,
         status,
         decided_by,
         decided_at,
@@ -1132,6 +1366,7 @@ function listTaskApprovals(database: DatabaseSync, taskId: string) {
         approval_type,
         requested_action,
         requested_payload_json,
+        resolution_payload_json,
         status,
         decided_by,
         decided_at,
@@ -1243,9 +1478,26 @@ function mapApprovalRow(row: ApprovalRow): ApprovalRecord {
     approval_type: row.approval_type,
     requested_action: row.requested_action,
     requested_payload_json: row.requested_payload_json,
+    resolution_payload_json: row.resolution_payload_json,
     status: row.status,
     decided_by: row.decided_by,
     decided_at: row.decided_at,
+    created_at: row.created_at,
+  };
+}
+
+function mapRiskyBashGrantRow(row: RiskyBashGrantRow): RiskyBashGrantRecord {
+  return {
+    id: row.id,
+    approval_id: row.approval_id,
+    repo_id: row.repo_id,
+    task_id: row.task_id,
+    session_key: row.session_key,
+    scope: row.scope,
+    command: row.command,
+    command_fingerprint: row.command_fingerprint,
+    decided_by: row.decided_by,
+    consumed_at: row.consumed_at,
     created_at: row.created_at,
   };
 }

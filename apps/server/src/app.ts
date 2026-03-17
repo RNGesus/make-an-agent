@@ -1,11 +1,15 @@
+import { createHash } from "node:crypto";
 import { readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, resolve as resolvePath, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   bootstrapControlPlaneDatabase,
   claimTaskExecution,
+  consumeRiskyBashGrant,
   createApproval,
+  createRiskyBashGrant,
   createTask,
+  findReusableRiskyBashGrant,
   getApproval,
   getLatestApprovedTaskApproval,
   getPendingTaskApproval,
@@ -25,9 +29,24 @@ import {
   updateRepositoryPolicy,
 } from "db/runtime";
 import { evaluatePolicyAction } from "policy-engine";
-import { autonomyModes, taskGoalTypes, type AutonomyMode, type TaskGoalType } from "shared";
+import {
+  approvalScopes,
+  autonomyModes,
+  taskGoalTypes,
+  type ApprovalScope,
+  type AutonomyMode,
+  type RiskyBashApprovalRequestPayload,
+  type TaskGoalType,
+} from "shared";
 import { resolveTaskRoute } from "task-router";
-import { executePiTask, type PiExecutionRequest, type PiExecutor } from "pi-runner";
+import {
+  PiCommandApprovalRequiredError,
+  PiExecutionBlockedError,
+  executePiTask,
+  type PiExecutionRequest,
+  type PiExecutor,
+  type PiRunnerRuntime,
+} from "pi-runner";
 import type { ServerConfig } from "./config.ts";
 import { defaultServerConfig } from "./config.ts";
 
@@ -94,6 +113,7 @@ type CreateTaskBody = {
 
 type ApprovalDecisionBody = {
   decided_by?: string;
+  scope?: string;
 };
 
 export interface CreateServerAppOptions extends Partial<ServerConfig> {
@@ -107,7 +127,7 @@ export function createServerApp(options: CreateServerAppOptions = {}): ServerApp
     ...configOverrides,
   };
   const database = bootstrapControlPlaneDatabase({ databasePath: config.database_path });
-  const piRuntime = pi_execute ? { execute: pi_execute } : undefined;
+  const piRuntime: PiRunnerRuntime | undefined = pi_execute ? { execute: pi_execute } : {};
 
   return {
     config,
@@ -124,7 +144,7 @@ async function routeRequest(
   request: Request,
   config: ServerConfig,
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
-  piRuntime?: { execute: PiExecutor },
+  piRuntime?: PiRunnerRuntime,
 ) {
   const url = new URL(request.url);
 
@@ -395,10 +415,20 @@ async function routeRequest(
 
     const decisionBody: ApprovalDecisionBody = body && isApprovalDecisionBody(body) ? body : {};
     const decidedBy = normalizeDecisionActor(decisionBody.decided_by);
+    const approvalScope =
+      approval.approval_type === "risky_bash" ? toApprovalScope(decisionBody.scope) : null;
+
+    if (approval.approval_type === "risky_bash" && !approvalScope) {
+      return jsonResponse(request, config, 400, {
+        error: "Risky bash approvals require a scope of once, session, or global.",
+      });
+    }
+
     const resolved = resolveApproval(database, approveMatch.approvalId, {
       status: "approved",
       decided_by: decidedBy,
       decided_at: new Date().toISOString(),
+      resolution_payload_json: approvalScope ? JSON.stringify({ scope: approvalScope }) : "{}",
     });
 
     if (!resolved) {
@@ -408,6 +438,29 @@ async function routeRequest(
     }
 
     const context = getTaskExecutionContext(database, resolved.task_id);
+    const riskyBashPayload =
+      resolved.approval_type === "risky_bash"
+        ? parseRiskyBashApprovalPayload(resolved.requested_payload_json)
+        : null;
+
+    if (resolved.approval_type === "risky_bash" && !riskyBashPayload) {
+      return jsonResponse(request, config, 400, {
+        error: "Risky bash approval payload is invalid and could not be resumed.",
+      });
+    }
+
+    if (resolved.approval_type === "risky_bash" && riskyBashPayload && approvalScope) {
+      createRiskyBashGrant(database, {
+        approval_id: resolved.id,
+        repo_id: riskyBashPayload.repo_id,
+        task_id: approvalScope === "global" ? null : riskyBashPayload.task_id,
+        session_key: approvalScope === "global" ? null : riskyBashPayload.session_key,
+        scope: approvalScope,
+        command: riskyBashPayload.command,
+        command_fingerprint: riskyBashPayload.command_fingerprint,
+        decided_by: decidedBy,
+      });
+    }
 
     if (context) {
       recordAuditEvent(
@@ -420,6 +473,7 @@ async function routeRequest(
           approval_id: resolved.id,
           approval_type: resolved.approval_type,
           decided_by: decidedBy,
+          ...(approvalScope ? { scope: approvalScope } : {}),
         },
       );
     }
@@ -763,7 +817,9 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isApprovalDecisionBody(value: unknown): value is ApprovalDecisionBody {
   return (
-    isObject(value) && (value.decided_by === undefined || typeof value.decided_by === "string")
+    isObject(value) &&
+    (value.decided_by === undefined || typeof value.decided_by === "string") &&
+    (value.scope === undefined || typeof value.scope === "string")
   );
 }
 
@@ -917,7 +973,7 @@ async function maybeExecuteTask(
   config: ServerConfig,
   taskId: string,
   executionReason: "start" | "retry" | "resume" = "start",
-  piRuntime?: { execute: PiExecutor },
+  piRuntime?: PiRunnerRuntime,
 ) {
   const context = getTaskExecutionContext(database, taskId);
 
@@ -1056,7 +1112,10 @@ async function maybeExecuteTask(
     }
   }
 
-  const startedAt = new Date().toISOString();
+  const startedAt =
+    executionReason === "resume" && context.task.started_at
+      ? context.task.started_at
+      : new Date().toISOString();
   const claimedExecution = claimTaskExecution(
     database,
     taskId,
@@ -1101,8 +1160,11 @@ async function maybeExecuteTask(
   );
 
   try {
-    const executionRequest = buildPiExecutionRequest(config, context);
-    const result = await executePiTask(executionRequest, piRuntime);
+    const executionRequest = buildPiExecutionRequest(config, context, startedAt);
+    const result = await executePiTask(
+      executionRequest,
+      buildPiRunnerRuntime(database, context, startedAt, piRuntime),
+    );
 
     replaceTaskArtifacts(
       database,
@@ -1133,6 +1195,84 @@ async function maybeExecuteTask(
       },
     );
   } catch (error) {
+    if (error instanceof PiCommandApprovalRequiredError) {
+      const pendingApproval = getPendingTaskApproval(database, taskId, error.approval_type);
+
+      if (!pendingApproval) {
+        const approval = createApproval(database, {
+          task_id: taskId,
+          approval_type: error.approval_type,
+          requested_action: error.requested_action,
+          requested_payload_json: JSON.stringify(error.requested_payload),
+        });
+
+        if (!approval) {
+          throw new Error(`Task '${taskId}' could not create its risky bash approval.`);
+        }
+
+        recordAuditEvent(
+          database,
+          context.repository.id,
+          context.task.id,
+          "task.approval.requested",
+          "Task execution paused for a risky bash command approval.",
+          {
+            approval_id: approval.id,
+            approval_type: approval.approval_type,
+            action: "bash",
+            command_fingerprint:
+              typeof error.requested_payload.command_fingerprint === "string"
+                ? error.requested_payload.command_fingerprint
+                : null,
+          },
+        );
+      }
+
+      updateTaskExecution(database, taskId, {
+        status: "awaiting_approval",
+        pi_session_id: context.task.pi_session_id,
+        branch_name: context.task.branch_name,
+        started_at: startedAt,
+        completed_at: null,
+      });
+
+      const detail = getTaskDetail(database, taskId);
+
+      if (!detail) {
+        throw new Error(`Task '${taskId}' disappeared while waiting for risky bash approval.`);
+      }
+
+      return detail;
+    }
+
+    if (error instanceof PiExecutionBlockedError) {
+      updateTaskExecution(database, taskId, {
+        status: "failed",
+        pi_session_id: context.task.pi_session_id,
+        branch_name: context.task.branch_name,
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+      });
+      recordAuditEvent(
+        database,
+        context.repository.id,
+        context.task.id,
+        "task.execution.blocked",
+        error.message,
+        {
+          action: error.action,
+        },
+      );
+
+      const detail = getTaskDetail(database, taskId);
+
+      if (!detail) {
+        throw new Error(`Task '${taskId}' disappeared after bash access was denied.`);
+      }
+
+      return detail;
+    }
+
     updateTaskExecution(database, taskId, {
       status: "failed",
       pi_session_id: context.task.pi_session_id,
@@ -1165,9 +1305,11 @@ async function maybeExecuteTask(
 function buildPiExecutionRequest(
   config: ServerConfig,
   context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+  startedAt: string,
 ): PiExecutionRequest {
   return {
     mode: config.pi_runner_mode,
+    execution_key: buildTaskExecutionKey(context.task.id, startedAt),
     repo: {
       id: context.repository.id,
       name: context.repository.name,
@@ -1200,6 +1342,89 @@ function buildPiExecutionRequest(
             provider: context.policy.strong_provider,
             model: context.policy.strong_model,
           },
+  };
+}
+
+function buildPiRunnerRuntime(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+  startedAt: string,
+  runtime?: PiRunnerRuntime,
+): PiRunnerRuntime {
+  const sessionKey = buildTaskExecutionKey(context.task.id, startedAt);
+
+  return {
+    ...runtime,
+    authorizeBashCommand({ command }) {
+      const decision = evaluatePolicyAction(context.policy, { kind: "bash", command });
+
+      if (!decision.allowed) {
+        return {
+          status: "deny" as const,
+          reason: decision.reason,
+        };
+      }
+
+      if (!decision.requires_approval) {
+        return {
+          status: "allow" as const,
+          scope: null,
+        };
+      }
+
+      const commandFingerprint = fingerprintCommand(command);
+      const grant = findReusableRiskyBashGrant(database, {
+        repo_id: context.repository.id,
+        task_id: context.task.id,
+        session_key: sessionKey,
+        command_fingerprint: commandFingerprint,
+      });
+
+      if (!grant) {
+        return {
+          status: "require_approval" as const,
+          requested_action: "Allow the risky bash command for this task.",
+          payload: {
+            repo_id: context.repository.id,
+            repo_name: context.repository.name,
+            task_id: context.task.id,
+            task_title: context.task.title,
+            goal_type: context.task.goal_type,
+            routing_tier: context.task.routing_tier,
+            command,
+            command_fingerprint: commandFingerprint,
+            session_key: sessionKey,
+          } satisfies RiskyBashApprovalRequestPayload,
+        };
+      }
+
+      if (grant.scope === "once") {
+        const consumed = consumeRiskyBashGrant(database, grant.id, new Date().toISOString());
+
+        if (!consumed) {
+          return {
+            status: "require_approval" as const,
+            requested_action: "Allow the risky bash command for this task.",
+            payload: {
+              repo_id: context.repository.id,
+              repo_name: context.repository.name,
+              task_id: context.task.id,
+              task_title: context.task.title,
+              goal_type: context.task.goal_type,
+              routing_tier: context.task.routing_tier,
+              command,
+              command_fingerprint: commandFingerprint,
+              session_key: sessionKey,
+            } satisfies RiskyBashApprovalRequestPayload,
+          };
+        }
+      }
+
+      return {
+        status: "allow" as const,
+        scope: grant.scope,
+      };
+    },
   };
 }
 
@@ -1289,6 +1514,62 @@ function normalizeDecisionActor(value: string | undefined) {
   const trimmed = value?.trim();
 
   return trimmed ? trimmed : null;
+}
+
+function toApprovalScope(value: string | undefined): ApprovalScope | null {
+  if (!value) {
+    return null;
+  }
+
+  return approvalScopes.includes(value as ApprovalScope) ? (value as ApprovalScope) : null;
+}
+
+function parseRiskyBashApprovalPayload(value: string): RiskyBashApprovalRequestPayload | null {
+  try {
+    const payload = JSON.parse(value) as Record<string, unknown>;
+
+    if (
+      typeof payload.repo_id !== "string" ||
+      typeof payload.repo_name !== "string" ||
+      typeof payload.task_id !== "string" ||
+      typeof payload.task_title !== "string" ||
+      typeof payload.goal_type !== "string" ||
+      typeof payload.command !== "string" ||
+      typeof payload.command_fingerprint !== "string" ||
+      typeof payload.session_key !== "string"
+    ) {
+      return null;
+    }
+
+    return {
+      repo_id: payload.repo_id,
+      repo_name: payload.repo_name,
+      task_id: payload.task_id,
+      task_title: payload.task_title,
+      goal_type: toTaskGoalType(payload.goal_type),
+      routing_tier:
+        payload.routing_tier === "cheap" || payload.routing_tier === "strong"
+          ? payload.routing_tier
+          : null,
+      command: payload.command,
+      command_fingerprint: payload.command_fingerprint,
+      session_key: payload.session_key,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildTaskExecutionKey(taskId: string, startedAt: string) {
+  return `${taskId}:${startedAt}`;
+}
+
+function normalizeCommandForApproval(command: string) {
+  return command.replaceAll("\r\n", "\n").trim();
+}
+
+function fingerprintCommand(command: string) {
+  return createHash("sha256").update(normalizeCommandForApproval(command)).digest("hex");
 }
 
 function toAutonomyMode(value: string): AutonomyMode {

@@ -1,6 +1,9 @@
 import {
+  approvalScopes,
   autonomyModes,
   taskGoalTypes,
+  type ApprovalRecord,
+  type ApprovalScope,
   type AutonomyMode,
   type RepositoryPolicyRecord,
   type RepositoryRecord,
@@ -40,6 +43,7 @@ type AuditEvent = {
 
 type TaskDetail = TaskSummary & {
   artifacts: TaskArtifact[];
+  approvals: ApprovalRecord[];
   audit_events: AuditEvent[];
 };
 
@@ -60,6 +64,8 @@ type AppState = {
   repositories: RepositoryDetail[];
   selectedRepoId: string | null;
   scanCandidates: RepositoryScanCandidate[];
+  approvals: ApprovalRecord[];
+  selectedApprovalId: string | null;
   tasks: TaskSummary[];
   selectedTaskId: string | null;
   selectedTask: TaskDetail | null;
@@ -74,6 +80,8 @@ const state: AppState = {
   repositories: [],
   selectedRepoId: null,
   scanCandidates: [],
+  approvals: [],
+  selectedApprovalId: null,
   tasks: [],
   selectedTaskId: null,
   selectedTask: null,
@@ -99,6 +107,7 @@ async function bootstrap() {
   try {
     await refreshRepositories();
     await refreshScanCandidates();
+    await refreshApprovals();
   } catch (error) {
     setError(toErrorMessage(error));
   } finally {
@@ -169,6 +178,19 @@ async function refreshTasks() {
   );
 }
 
+async function refreshApprovals() {
+  const payload = await apiRequest<{ approvals: ApprovalRecord[] }>("/api/approvals");
+
+  state.approvals = payload.approvals;
+
+  if (
+    !state.selectedApprovalId ||
+    !state.approvals.some((approval) => approval.id === state.selectedApprovalId)
+  ) {
+    state.selectedApprovalId = state.approvals[0]?.id ?? null;
+  }
+}
+
 async function selectRepository(repoId: string) {
   state.selectedRepoId = repoId;
   state.selectedTaskId = null;
@@ -197,6 +219,12 @@ async function selectTask(taskId: string) {
   } finally {
     render();
   }
+}
+
+function selectApproval(approvalId: string) {
+  state.selectedApprovalId = approvalId;
+  state.error = null;
+  render();
 }
 
 async function importRepository(rootPath: string, parentSource: string) {
@@ -288,6 +316,7 @@ async function createTaskFromForm(form: HTMLFormElement) {
     form.reset();
     state.notice = `Created task ${detail.task.title}.`;
     await refreshTasks();
+    await refreshApprovals();
     state.selectedTaskId = detail.task.id;
     state.selectedTask = detail;
   });
@@ -301,8 +330,46 @@ async function retryTask(taskId: string) {
 
     state.notice = `Updated task ${detail.task.title}.`;
     await refreshTasks();
+    await refreshApprovals();
     state.selectedTaskId = detail.task.id;
     state.selectedTask = detail;
+  });
+}
+
+async function approveApproval(approvalId: string, scope: ApprovalScope | null) {
+  await runAction("Resolving approval...", async () => {
+    const payload = scope ? { scope } : {};
+    const result = await apiRequest<{
+      approval: ApprovalRecord;
+      task: TaskDetail;
+    }>(`/api/approvals/${encodeURIComponent(approvalId)}/approve`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    state.notice = `Approved ${result.approval.approval_type} for ${result.task.task.title}.`;
+    await refreshApprovals();
+    await refreshTasks();
+    state.selectedTaskId = result.task.task.id;
+    state.selectedTask = result.task;
+  });
+}
+
+async function rejectApproval(approvalId: string) {
+  await runAction("Rejecting approval...", async () => {
+    const result = await apiRequest<{
+      approval: ApprovalRecord;
+      task: TaskDetail;
+    }>(`/api/approvals/${encodeURIComponent(approvalId)}/reject`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+
+    state.notice = `Rejected ${result.approval.approval_type} for ${result.task.task.title}.`;
+    await refreshApprovals();
+    await refreshTasks();
+    state.selectedTaskId = result.task.task.id;
+    state.selectedTask = result.task;
   });
 }
 
@@ -335,9 +402,9 @@ function render() {
           <p class="eyebrow">Pi Remote Control App</p>
           <h1>Repo intake, policy controls, and task routing now share one operator surface.</h1>
           <p class="lede">
-            This slice follows the approved plan through Milestone 3: scan existing workspaces, register repos,
-            tune per-repo autonomy, route new tasks, then persist read-only execution sessions and compact
-            artifacts for review.
+            This slice now covers Milestones 1 through 4: scan existing workspaces, register repos, tune
+            per-repo autonomy, route tasks, then review and resume approval-gated edits and risky bash
+            commands from the same control surface.
           </p>
         </div>
 
@@ -348,7 +415,7 @@ function render() {
           </div>
           <div>
             <p class="eyebrow">Milestone focus</p>
-            <strong>M1 - M3</strong>
+            <strong>M1 - M4</strong>
           </div>
           <div>
             <p class="eyebrow">Live state</p>
@@ -403,6 +470,17 @@ function render() {
               ${selectedRepository ? `<span class="badge">${escapeHtml(selectedRepository.repository.default_branch)}</span>` : ""}
             </div>
             ${renderPolicyPanel(selectedRepository)}
+          </article>
+
+          <article class="panel">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Approval Queue</p>
+                <h2>Pending approvals and resume controls</h2>
+              </div>
+              <span class="badge">${state.approvals.length} pending</span>
+            </div>
+            ${renderApprovalPanel()}
           </article>
 
           <section class="task-grid">
@@ -666,12 +744,102 @@ function renderTaskAction(taskDetail: TaskDetail | null) {
   return `<button class="ghost-button" type="button" data-task-retry="${escapeHtml(taskDetail.task.id)}">Run task</button>`;
 }
 
+function renderApprovalPanel() {
+  const selectedApproval = getSelectedApproval();
+
+  return `
+    <div class="approval-grid">
+      <div class="approval-list">${renderApprovalList()}</div>
+      <div class="detail-card detail-card-stack approval-detail">${renderApprovalDetail(selectedApproval)}</div>
+    </div>
+  `;
+}
+
+function renderApprovalList() {
+  if (state.approvals.length === 0) {
+    return `<p class="empty-state">No approvals are waiting right now.</p>`;
+  }
+
+  return state.approvals
+    .map((approval) => {
+      const meta = readApprovalRequestMeta(approval);
+      const isSelected = approval.id === state.selectedApprovalId;
+
+      return `
+        <button class="task-item ${isSelected ? "task-item-selected" : ""}" type="button" data-approval-id="${escapeHtml(approval.id)}">
+          <span>
+            <strong>${escapeHtml(meta.task_title ?? approval.requested_action)}</strong>
+            <small>${escapeHtml(meta.repo_name ?? approval.approval_type)} · ${escapeHtml(approval.approval_type)}</small>
+          </span>
+          <span class="chip">${escapeHtml(approval.approval_type)}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderApprovalDetail(approval: ApprovalRecord | null) {
+  if (!approval) {
+    return `<p class="empty-state">Select a pending approval to inspect the requested action and resume the task.</p>`;
+  }
+
+  const meta = readApprovalRequestMeta(approval);
+  const commandBlock =
+    approval.approval_type === "risky_bash" && meta.command
+      ? `<pre class="command-preview"><code>${escapeHtml(meta.command)}</code></pre>`
+      : "";
+  const approveActions =
+    approval.approval_type === "risky_bash"
+      ? approvalScopes
+          .map(
+            (scope) => `
+              <button
+                class="solid-button"
+                type="button"
+                data-approval-approve="${escapeHtml(approval.id)}"
+                data-approval-scope="${escapeHtml(scope)}"
+              >
+                ${escapeHtml(renderApprovalScopeLabel(scope))}
+              </button>
+            `,
+          )
+          .join("")
+      : `
+          <button class="solid-button" type="button" data-approval-approve="${escapeHtml(approval.id)}">
+            Approve
+          </button>
+        `;
+
+  return `
+    <div class="detail-row">
+      <span class="chip">${escapeHtml(approval.approval_type)}</span>
+      <span class="chip chip-soft">${escapeHtml(approval.created_at)}</span>
+    </div>
+    <p>${escapeHtml(approval.requested_action)}</p>
+    <dl class="detail-grid">
+      <div>
+        <dt>Repository</dt>
+        <dd>${escapeHtml(meta.repo_name ?? "Unknown")}</dd>
+      </div>
+      <div>
+        <dt>Task</dt>
+        <dd>${escapeHtml(meta.task_title ?? approval.task_id)}</dd>
+      </div>
+    </dl>
+    ${commandBlock}
+    <div class="approval-actions">
+      ${approveActions}
+      <button class="ghost-button" type="button" data-approval-reject="${escapeHtml(approval.id)}">Reject</button>
+    </div>
+  `;
+}
+
 function renderTaskDetail() {
   if (!state.selectedTask) {
     return `<p class="empty-state">Select a task to inspect the stored session, artifacts, and routing record.</p>`;
   }
 
-  const { task, repository, artifacts, audit_events: auditEvents } = state.selectedTask;
+  const { task, repository, artifacts, approvals, audit_events: auditEvents } = state.selectedTask;
   const classifierConfidence =
     task.classifier_confidence === null
       ? "Not used"
@@ -736,6 +904,12 @@ function renderTaskDetail() {
         </div>
       </div>
       <div class="detail-section">
+        <p class="eyebrow">Approval history</p>
+        <div class="detail-card detail-card-stack">
+          ${renderTaskApprovals(approvals)}
+        </div>
+      </div>
+      <div class="detail-section">
         <p class="eyebrow">Audit trail</p>
         <div class="detail-card detail-card-stack">
           ${renderAuditEvents(auditEvents)}
@@ -789,6 +963,33 @@ function renderAuditEvents(auditEvents: AuditEvent[]) {
     .join("")}</div>`;
 }
 
+function renderTaskApprovals(approvals: ApprovalRecord[]) {
+  if (approvals.length === 0) {
+    return `<p class="empty-state">No approvals were recorded for this task.</p>`;
+  }
+
+  return `<div class="artifact-list">${approvals
+    .map((approval) => {
+      const meta = readApprovalRequestMeta(approval);
+      const scope = readApprovalScope(approval);
+      const title =
+        approval.approval_type === "risky_bash" && meta.command
+          ? meta.command
+          : approval.requested_action;
+
+      return `
+        <div class="artifact-row artifact-row-stack">
+          <strong>${escapeHtml(title)}</strong>
+          <small>
+            ${escapeHtml(approval.approval_type)} · ${escapeHtml(approval.status)}
+            ${scope ? ` · ${escapeHtml(scope)}` : ""}
+          </small>
+        </div>
+      `;
+    })
+    .join("")}</div>`;
+}
+
 function bindEvents() {
   document
     .querySelector<HTMLElement>("[data-action='scan-repos']")
@@ -830,6 +1031,39 @@ function bindEvents() {
     });
   }
 
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-approval-id]")) {
+    button.addEventListener("click", () => {
+      const approvalId = button.dataset.approvalId;
+
+      if (approvalId) {
+        selectApproval(approvalId);
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-approval-approve]")) {
+    button.addEventListener("click", () => {
+      const approvalId = button.dataset.approvalApprove;
+      const scope = button.dataset.approvalScope
+        ? (button.dataset.approvalScope as ApprovalScope)
+        : null;
+
+      if (approvalId) {
+        void approveApproval(approvalId, scope);
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-approval-reject]")) {
+    button.addEventListener("click", () => {
+      const approvalId = button.dataset.approvalReject;
+
+      if (approvalId) {
+        void rejectApproval(approvalId);
+      }
+    });
+  }
+
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task-retry]")) {
     button.addEventListener("click", () => {
       const taskId = button.dataset.taskRetry;
@@ -859,6 +1093,10 @@ function bindEvents() {
 
 function getSelectedRepository() {
   return state.repositories.find((entry) => entry.repository.id === state.selectedRepoId) ?? null;
+}
+
+function getSelectedApproval() {
+  return state.approvals.find((approval) => approval.id === state.selectedApprovalId) ?? null;
 }
 
 function renderOptions(values: readonly string[], selectedValue: string | null) {
@@ -929,6 +1167,41 @@ function readArtifactValue<T>(artifacts: TaskArtifact[], artifactType: string) {
 
   try {
     return JSON.parse(artifact.payload_json) as T;
+  } catch {
+    return null;
+  }
+}
+
+function readApprovalRequestMeta(approval: ApprovalRecord) {
+  const payload = readJsonValue<Record<string, unknown>>(approval.requested_payload_json);
+
+  return {
+    repo_name: typeof payload?.repo_name === "string" ? payload.repo_name : null,
+    task_title: typeof payload?.task_title === "string" ? payload.task_title : null,
+    command: typeof payload?.command === "string" ? payload.command : null,
+  };
+}
+
+function readApprovalScope(approval: ApprovalRecord) {
+  const payload = readJsonValue<{ scope?: ApprovalScope }>(approval.resolution_payload_json);
+
+  return payload?.scope ?? null;
+}
+
+function renderApprovalScopeLabel(scope: ApprovalScope) {
+  switch (scope) {
+    case "once":
+      return "Accept Once";
+    case "session":
+      return "Accept For Session";
+    case "global":
+      return "Accept Globally";
+  }
+}
+
+function readJsonValue<T>(value: string) {
+  try {
+    return JSON.parse(value) as T;
   } catch {
     return null;
   }

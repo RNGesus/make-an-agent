@@ -198,7 +198,9 @@ textarea {
 .detail-stack,
 .candidate-list,
 .repo-list,
-.task-list {
+.task-list,
+.approval-list,
+.approval-detail {
   display: grid;
   gap: 18px;
 }
@@ -210,6 +212,12 @@ textarea {
 
 .detail-panel {
   background: var(--panel-strong);
+}
+
+.approval-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.85fr) minmax(0, 1.15fr);
+  gap: 18px;
 }
 
 .section-head {
@@ -422,6 +430,12 @@ label span {
   justify-content: flex-end;
 }
 
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .detail-prompt {
   padding: 16px 18px;
   border-radius: 22px;
@@ -487,6 +501,15 @@ code {
   font-family: var(--mono);
 }
 
+.command-preview {
+  margin: 0;
+  padding: 16px 18px;
+  border-radius: 22px;
+  background: rgba(24, 50, 64, 0.92);
+  color: #f7efe6;
+  overflow-x: auto;
+}
+
 @keyframes float {
   0%,
   100% {
@@ -500,7 +523,8 @@ code {
 @media (max-width: 1180px) {
   .layout,
   .task-grid,
-  .hero {
+  .hero,
+  .approval-grid {
     grid-template-columns: 1fr;
   }
 

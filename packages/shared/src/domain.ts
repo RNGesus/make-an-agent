@@ -19,6 +19,7 @@ export const artifactTypes = [
 ] as const;
 export const approvalTypes = ["edit", "risky_bash", "commit", "pull_request"] as const;
 export const approvalStatuses = ["pending", "approved", "rejected"] as const;
+export const approvalScopes = ["once", "session", "global"] as const;
 
 export type AutonomyMode = (typeof autonomyModes)[number];
 export type TaskGoalType = (typeof taskGoalTypes)[number];
@@ -27,6 +28,7 @@ export type RoutingTier = (typeof routingTiers)[number];
 export type ArtifactType = (typeof artifactTypes)[number];
 export type ApprovalType = (typeof approvalTypes)[number];
 export type ApprovalStatus = (typeof approvalStatuses)[number];
+export type ApprovalScope = (typeof approvalScopes)[number];
 
 export interface RepositoryRecord {
   id: string;
@@ -99,9 +101,36 @@ export interface ApprovalRecord {
   approval_type: ApprovalType;
   requested_action: string;
   requested_payload_json: string;
+  resolution_payload_json: string;
   status: ApprovalStatus;
   decided_by: string | null;
   decided_at: string | null;
+  created_at: string;
+}
+
+export interface RiskyBashApprovalRequestPayload {
+  repo_id: string;
+  repo_name: string;
+  task_id: string;
+  task_title: string;
+  goal_type: TaskGoalType;
+  routing_tier: RoutingTier | null;
+  command: string;
+  command_fingerprint: string;
+  session_key: string;
+}
+
+export interface RiskyBashGrantRecord {
+  id: string;
+  approval_id: string;
+  repo_id: string;
+  task_id: string | null;
+  session_key: string | null;
+  scope: ApprovalScope;
+  command: string;
+  command_fingerprint: string;
+  decided_by: string | null;
+  consumed_at: string | null;
   created_at: string;
 }
 

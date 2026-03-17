@@ -73,9 +73,24 @@ CREATE TABLE IF NOT EXISTS approvals (
   approval_type TEXT NOT NULL,
   requested_action TEXT NOT NULL,
   requested_payload_json TEXT NOT NULL,
+  resolution_payload_json TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'pending',
   decided_by TEXT,
   decided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS risky_bash_grants (
+  id TEXT PRIMARY KEY,
+  approval_id TEXT NOT NULL REFERENCES approvals(id) ON DELETE CASCADE,
+  repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+  session_key TEXT,
+  scope TEXT NOT NULL CHECK (scope IN ('once', 'session', 'global')),
+  command TEXT NOT NULL,
+  command_fingerprint TEXT NOT NULL,
+  decided_by TEXT,
+  consumed_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -117,5 +132,13 @@ CREATE INDEX IF NOT EXISTS approvals_status_created_idx ON approvals(status, cre
 CREATE UNIQUE INDEX IF NOT EXISTS approvals_pending_task_type_idx
 ON approvals(task_id, approval_type)
 WHERE status = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS risky_bash_grants_approval_idx
+ON risky_bash_grants(approval_id);
+CREATE INDEX IF NOT EXISTS risky_bash_grants_repo_command_idx
+ON risky_bash_grants(repo_id, command_fingerprint, scope, created_at DESC);
+CREATE INDEX IF NOT EXISTS risky_bash_grants_task_command_idx
+ON risky_bash_grants(task_id, command_fingerprint, scope, created_at DESC);
+CREATE INDEX IF NOT EXISTS risky_bash_grants_session_command_idx
+ON risky_bash_grants(session_key, command_fingerprint, scope, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_repo_created_idx ON audit_events(repo_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_task_created_idx ON audit_events(task_id, created_at DESC);
