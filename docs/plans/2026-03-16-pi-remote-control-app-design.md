@@ -3,6 +3,8 @@
 Date: 2026-03-16
 Status: Approved
 
+Implementation checkpoint: Phase 0 completed on 2026-03-17
+
 ## Goal
 
 Build a web-first application that remotely controls `pi-coding-agent` for coding tasks in existing server-local repositories. The system should support multiple providers and models, route simpler work to cheaper models, escalate harder work to stronger models, enforce per-repo security policies, and make it easy to review diffs and create pull requests.
@@ -59,6 +61,24 @@ The repository is no longer greenfield.
 - The next step should preserve those assets and migrate the web foundation safely instead of restarting the implementation from scratch.
 
 This means the delivery plan should include a foundation realignment phase before milestone work continues.
+
+## Phase 0 Checkpoint
+
+Phase 0 has now been implemented in `apps/web`.
+
+- The web app runs on TanStack Start instead of the previous plain Vite entrypoint.
+- The old single-file DOM renderer in `apps/web/src/main.ts` has been replaced by route files, page modules, shared UI components, and React state helpers.
+- The current operator flows remain on the same backend API contract: repository scan/import, policy editing, task intake, task history, task detail, approval queue, approval approval/rejection, and risky bash scope selection.
+
+Verified route map:
+
+- `/repos`
+- `/repos/$repoId`
+- `/repos/$repoId/tasks/$taskId`
+- `/approvals`
+- `/approvals/$approvalId`
+
+The next planning and implementation work should assume this TanStack Start foundation already exists and should focus on milestone gap closure rather than on any further web-shell migration.
 
 ## Architecture
 

@@ -5,16 +5,25 @@
   "type": "module",
   "scripts": {
     "dev": "vp dev",
-    "build": "tsc && vp build",
+    "build": "vp build",
     "preview": "vp preview"
   },
   "dependencies": {
+    "@tanstack/react-router": "catalog:",
+    "@tanstack/react-start": "catalog:",
     "db": "workspace:*",
+    "react": "catalog:",
+    "react-dom": "catalog:",
     "shared": "workspace:*"
   },
   "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
-    "vite-plus": "catalog:"
+    "vite-plus": "catalog:",
+    "vite-tsconfig-paths": "catalog:"
   }
 }

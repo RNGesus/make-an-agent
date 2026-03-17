@@ -3,6 +3,8 @@
 Date: 2026-03-16
 Status: Draft
 
+Phase 0 status: Implemented and verified on 2026-03-17
+
 ## Objective
 
 Implement the approved MVP for a web-first control plane around `pi-coding-agent` that can:
@@ -106,23 +108,52 @@ Document which items in Milestones 1 through 4 are:
 - Existing operator flows still work after the migration.
 - The plan for Milestones 1 through 4 is updated from assumptions to verified remaining work.
 
-## Milestone Status Snapshot Before Phase 0
+### Verified Phase 0 Route Map
+
+- `/repos`
+- `/repos/$repoId`
+- `/repos/$repoId/tasks/$taskId`
+- `/approvals`
+- `/approvals/$approvalId`
+
+### Verified Phase 0 Component Buckets
+
+- Root shell and navigation: `src/routes/__root.tsx`, `src/router.tsx`, `src/components/operator-layout.tsx`
+- Repository import surface: `src/components/repository-panels.tsx`
+- Policy editing surface: `src/components/policy-panel.tsx`
+- Task intake, history, and detail surfaces: `src/components/task-panels.tsx`
+- Approval inbox and resolution surface: `src/components/approval-panel.tsx`
+- Shared client state and API helpers: `src/lib/operator-app.tsx`, `src/lib/repo-workspace.ts`, `src/lib/operator-api.ts`
+
+## Milestone Status Snapshot After Phase 0 Verification
 
 ### Milestone 1
 
-Partially implemented: repository scan, registration, and policy editing already exist, but they need to live on the correct web foundation and be re-verified after migration.
+Mostly implemented and re-verified.
+
+- Already implemented: repository scan, repository registration, repository listing, policy patching, allowed-root validation, default policy generation, and route-oriented repo views.
+- Still missing or shallow: editing `safe_command_patterns` in the web UI, stronger repo-detail presentation beyond the current operator dashboard, and explicit UX around inactive repositories.
 
 ### Milestone 2
 
-Partially implemented: task intake, routing persistence, and task detail views already exist, but they need verification and consolidation after the foundation move.
+Mostly implemented and re-verified.
+
+- Already implemented: task creation, inferred goal typing, cheap-vs-strong routing persistence, classifier metadata persistence, task retry, task history, and route-based task detail pages.
+- Still missing or shallow: dedicated UX for diff route access, clearer routing-history presentation, and tighter separation between repo overview and task-focused screens.
 
 ### Milestone 3
 
-Partially implemented: pi-runner integration points and execution-related flows exist, but lifecycle control and storage behavior still need confirmation.
+Partially implemented and verified.
+
+- Already implemented: pi-runner integration, persisted `pi_session_id`, final-answer artifacts, changed-file capture, diff-summary capture, and execution-note storage with server tests covering completion paths.
+- Still missing or shallow: richer lifecycle visibility, stronger operational controls around long-running execution, and explicit verification of storage/query ergonomics outside the current happy-path tests.
 
 ### Milestone 4
 
-Partially implemented: approval records, risky bash scopes, and related UI already exist, but policy enforcement coverage and resume semantics still need hardening.
+Partially implemented and verified.
+
+- Already implemented: approval queue listing, edit approvals, risky bash approvals with once/session/global scopes, reject flow, resume flow, approval history rendering, and concurrency coverage in server tests.
+- Still missing or shallow: a dedicated diff-review action in the UI, broader policy-enforcement coverage at the UI layer, and more explicit operator guidance around why a task paused and what will resume after approval.
 
 ## Core Domain Model
 

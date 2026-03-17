@@ -1,6 +1,12 @@
 import { defineConfig } from "vite-plus";
+import react from "@vitejs/plugin-react";
+import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 
 export default defineConfig({
+  plugins: [tanstackStart({ spa: { enabled: true } }), react()],
+  resolve: {
+    tsconfigPaths: true,
+  },
   server: {
     proxy: {
       "/api": {

@@ -2,6 +2,7 @@
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "useDefineForClassFields": true,
+    "jsx": "react-jsx",
     "module": "ESNext",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": ["vite/client"],
