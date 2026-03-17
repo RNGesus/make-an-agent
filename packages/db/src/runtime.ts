@@ -5,6 +5,9 @@ import { randomUUID } from "node:crypto";
 import type {
   ArtifactType,
   AuditEventRecord,
+  ApprovalRecord,
+  ApprovalStatus,
+  ApprovalType,
   RepositoryPolicyRecord,
   RepositoryRecord,
   TaskArtifactRecord,
@@ -99,6 +102,18 @@ interface AuditEventRow {
   created_at: string;
 }
 
+interface ApprovalRow {
+  id: string;
+  task_id: string;
+  approval_type: ApprovalType;
+  requested_action: string;
+  requested_payload_json: string;
+  status: ApprovalStatus;
+  decided_by: string | null;
+  decided_at: string | null;
+  created_at: string;
+}
+
 export type RepositoryPolicyValues = Omit<RepositoryPolicyRecord, "repo_id">;
 
 export interface RepositoryRegistrationInput {
@@ -140,6 +155,7 @@ export interface TaskSummary {
 
 export interface TaskDetail extends TaskSummary {
   artifacts: TaskArtifactRecord[];
+  approvals: ApprovalRecord[];
   audit_events: AuditEventRecord[];
 }
 
@@ -153,6 +169,19 @@ export interface TaskArtifactValues {
   artifact_type: ArtifactType;
   summary: string;
   payload_json: string;
+}
+
+export interface ApprovalValues {
+  task_id: string;
+  approval_type: ApprovalType;
+  requested_action: string;
+  requested_payload_json: string;
+}
+
+export interface ApprovalResolutionValues {
+  status: Extract<ApprovalStatus, "approved" | "rejected">;
+  decided_by: string | null;
+  decided_at: string;
 }
 
 export interface TaskExecutionValues {
@@ -491,9 +520,53 @@ export function getTaskDetail(database: DatabaseSync, taskId: string) {
     ? {
         ...mapTaskSummaryRow(row),
         artifacts: listTaskArtifacts(database, taskId),
+        approvals: listTaskApprovals(database, taskId),
         audit_events: listTaskAuditEvents(database, taskId),
       }
     : null;
+}
+
+export function listApprovals(database: DatabaseSync, status: ApprovalStatus = "pending") {
+  const rows = database
+    .prepare(
+      `SELECT
+        id,
+        task_id,
+        approval_type,
+        requested_action,
+        requested_payload_json,
+        status,
+        decided_by,
+        decided_at,
+        created_at
+      FROM approvals
+      WHERE status = :status
+      ORDER BY created_at ASC, id ASC`,
+    )
+    .all({ status }) as unknown as ApprovalRow[];
+
+  return rows.map(mapApprovalRow);
+}
+
+export function getApproval(database: DatabaseSync, approvalId: string) {
+  const row = database
+    .prepare(
+      `SELECT
+        id,
+        task_id,
+        approval_type,
+        requested_action,
+        requested_payload_json,
+        status,
+        decided_by,
+        decided_at,
+        created_at
+      FROM approvals
+      WHERE id = :approvalId`,
+    )
+    .get({ approvalId }) as unknown as ApprovalRow | undefined;
+
+  return row ? mapApprovalRow(row) : null;
 }
 
 export function getTaskExecutionContext(database: DatabaseSync, taskId: string) {
@@ -634,6 +707,44 @@ export function updateTaskExecution(
   return getTaskRecord(database, taskId);
 }
 
+export function claimTaskExecution(
+  database: DatabaseSync,
+  taskId: string,
+  allowedStatuses: readonly TaskRecord["status"][],
+  values: TaskExecutionValues,
+) {
+  if (allowedStatuses.length === 0) {
+    return null;
+  }
+
+  const statusBindings = Object.fromEntries(
+    allowedStatuses.map((status, index) => [`status_${index}`, status]),
+  );
+  const placeholders = allowedStatuses.map((_, index) => `:status_${index}`).join(", ");
+  const result = database
+    .prepare(
+      `UPDATE tasks
+       SET status = :status,
+           pi_session_id = :pi_session_id,
+           branch_name = :branch_name,
+           started_at = :started_at,
+           completed_at = :completed_at
+       WHERE id = :id
+         AND status IN (${placeholders})`,
+    )
+    .run({
+      id: taskId,
+      status: values.status,
+      pi_session_id: values.pi_session_id,
+      branch_name: values.branch_name,
+      started_at: values.started_at,
+      completed_at: values.completed_at,
+      ...statusBindings,
+    });
+
+  return result.changes === 0 ? null : getTaskRecord(database, taskId);
+}
+
 export function replaceTaskArtifacts(
   database: DatabaseSync,
   taskId: string,
@@ -670,6 +781,134 @@ export function replaceTaskArtifacts(
       payload_json: artifact.payload_json,
     });
   }
+}
+
+export function createApproval(database: DatabaseSync, values: ApprovalValues) {
+  const approvalId = randomUUID();
+
+  const result = database
+    .prepare(
+      `INSERT OR IGNORE INTO approvals (
+        id,
+        task_id,
+        approval_type,
+        requested_action,
+        requested_payload_json,
+        status,
+        decided_by,
+        decided_at
+      ) VALUES (
+        :id,
+        :task_id,
+        :approval_type,
+        :requested_action,
+        :requested_payload_json,
+        'pending',
+        NULL,
+        NULL
+      )`,
+    )
+    .run({
+      id: approvalId,
+      task_id: values.task_id,
+      approval_type: values.approval_type,
+      requested_action: values.requested_action,
+      requested_payload_json: values.requested_payload_json,
+    });
+
+  return result.changes === 0
+    ? getPendingTaskApproval(database, values.task_id, values.approval_type)
+    : getApproval(database, approvalId);
+}
+
+export function resolveApproval(
+  database: DatabaseSync,
+  approvalId: string,
+  values: ApprovalResolutionValues,
+) {
+  const result = database
+    .prepare(
+      `UPDATE approvals
+       SET status = :status,
+           decided_by = :decided_by,
+           decided_at = :decided_at
+       WHERE id = :id
+         AND status = 'pending'`,
+    )
+    .run({
+      id: approvalId,
+      status: values.status,
+      decided_by: values.decided_by,
+      decided_at: values.decided_at,
+    });
+
+  if (result.changes === 0) {
+    return null;
+  }
+
+  return getApproval(database, approvalId);
+}
+
+export function getPendingTaskApproval(
+  database: DatabaseSync,
+  taskId: string,
+  approvalType?: ApprovalType,
+) {
+  const row = database
+    .prepare(
+      `SELECT
+        id,
+        task_id,
+        approval_type,
+        requested_action,
+        requested_payload_json,
+        status,
+        decided_by,
+        decided_at,
+        created_at
+      FROM approvals
+      WHERE task_id = :taskId
+        AND status = 'pending'
+        ${approvalType ? "AND approval_type = :approvalType" : ""}
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+    )
+    .get(approvalType ? { taskId, approvalType } : { taskId }) as unknown as
+    | ApprovalRow
+    | undefined;
+
+  return row ? mapApprovalRow(row) : null;
+}
+
+export function getLatestApprovedTaskApproval(
+  database: DatabaseSync,
+  taskId: string,
+  approvalType?: ApprovalType,
+) {
+  const row = database
+    .prepare(
+      `SELECT
+        id,
+        task_id,
+        approval_type,
+        requested_action,
+        requested_payload_json,
+        status,
+        decided_by,
+        decided_at,
+        created_at
+      FROM approvals
+      WHERE task_id = :taskId
+        AND status = 'approved'
+        ${approvalType ? "AND approval_type = :approvalType" : ""}
+      ORDER BY decided_at DESC, created_at DESC, id DESC
+      LIMIT 1`,
+    )
+    .get(approvalType ? { taskId, approvalType } : { taskId }) as unknown as
+    | ApprovalRow
+    | undefined;
+
+  return row ? mapApprovalRow(row) : null;
 }
 
 export function recordAuditEvent(
@@ -884,6 +1123,28 @@ function listTaskAuditEvents(database: DatabaseSync, taskId: string) {
   return rows.map(mapAuditEventRow);
 }
 
+function listTaskApprovals(database: DatabaseSync, taskId: string) {
+  const rows = database
+    .prepare(
+      `SELECT
+        id,
+        task_id,
+        approval_type,
+        requested_action,
+        requested_payload_json,
+        status,
+        decided_by,
+        decided_at,
+        created_at
+      FROM approvals
+      WHERE task_id = :taskId
+      ORDER BY created_at ASC, id ASC`,
+    )
+    .all({ taskId }) as unknown as ApprovalRow[];
+
+  return rows.map(mapApprovalRow);
+}
+
 function mapRepositoryDetailRow(row: RepositoryRow & RepositoryPolicyRow): RepositoryDetail {
   return {
     repository: mapRepositoryRow(row),
@@ -971,6 +1232,20 @@ function mapTaskArtifactRow(row: TaskArtifactRow): TaskArtifactRecord {
     artifact_type: row.artifact_type,
     summary: row.summary,
     payload_json: row.payload_json,
+    created_at: row.created_at,
+  };
+}
+
+function mapApprovalRow(row: ApprovalRow): ApprovalRecord {
+  return {
+    id: row.id,
+    task_id: row.task_id,
+    approval_type: row.approval_type,
+    requested_action: row.requested_action,
+    requested_payload_json: row.requested_payload_json,
+    status: row.status,
+    decided_by: row.decided_by,
+    decided_at: row.decided_at,
     created_at: row.created_at,
   };
 }

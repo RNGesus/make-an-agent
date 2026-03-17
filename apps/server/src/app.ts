@@ -3,16 +3,23 @@ import { dirname, resolve as resolvePath, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   bootstrapControlPlaneDatabase,
+  claimTaskExecution,
+  createApproval,
   createTask,
+  getApproval,
+  getLatestApprovedTaskApproval,
+  getPendingTaskApproval,
   getTaskDetail,
   getTaskExecutionContext,
   getRepositoryDetail,
   getRepositoryByRootPath,
+  listApprovals,
   listTasks,
   listRepositories,
   recordAuditEvent,
   registerRepository,
   replaceTaskArtifacts,
+  resolveApproval,
   type RepositoryPolicyValues,
   updateTaskExecution,
   updateRepositoryPolicy,
@@ -20,7 +27,7 @@ import {
 import { evaluatePolicyAction } from "policy-engine";
 import { autonomyModes, taskGoalTypes, type AutonomyMode, type TaskGoalType } from "shared";
 import { resolveTaskRoute } from "task-router";
-import { executePiTask, type PiExecutionRequest } from "pi-runner";
+import { executePiTask, type PiExecutionRequest, type PiExecutor } from "pi-runner";
 import type { ServerConfig } from "./config.ts";
 import { defaultServerConfig } from "./config.ts";
 
@@ -85,17 +92,27 @@ type CreateTaskBody = {
   expected_file_count?: number;
 };
 
-export function createServerApp(overrides: Partial<ServerConfig> = {}): ServerApp {
+type ApprovalDecisionBody = {
+  decided_by?: string;
+};
+
+export interface CreateServerAppOptions extends Partial<ServerConfig> {
+  pi_execute?: PiExecutor;
+}
+
+export function createServerApp(options: CreateServerAppOptions = {}): ServerApp {
+  const { pi_execute, ...configOverrides } = options;
   const config: ServerConfig = {
     ...defaultServerConfig,
-    ...overrides,
+    ...configOverrides,
   };
   const database = bootstrapControlPlaneDatabase({ databasePath: config.database_path });
+  const piRuntime = pi_execute ? { execute: pi_execute } : undefined;
 
   return {
     config,
     async handleRequest(request) {
-      return routeRequest(request, config, database);
+      return routeRequest(request, config, database, piRuntime);
     },
     close() {
       database.close();
@@ -107,6 +124,7 @@ async function routeRequest(
   request: Request,
   config: ServerConfig,
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  piRuntime?: { execute: PiExecutor },
 ) {
   const url = new URL(request.url);
 
@@ -232,6 +250,12 @@ async function routeRequest(
     return jsonResponse(request, config, 200, { tasks: listTasks(database, repoId) });
   }
 
+  if (request.method === "GET" && url.pathname === "/api/approvals") {
+    return jsonResponse(request, config, 200, {
+      approvals: listApprovals(database),
+    });
+  }
+
   if (request.method === "POST" && url.pathname === "/api/tasks") {
     const body = await readJsonBody(request);
 
@@ -294,7 +318,13 @@ async function routeRequest(
         completed_at: null,
       });
 
-      const executedTask = await maybeExecuteTask(database, config, task.task.id);
+      const executedTask = await maybeExecuteTask(
+        database,
+        config,
+        task.task.id,
+        "start",
+        piRuntime,
+      );
 
       return jsonResponse(request, config, 201, executedTask);
     } catch (error) {
@@ -327,9 +357,148 @@ async function routeRequest(
       });
     }
 
-    const executedTask = await maybeExecuteTask(database, config, taskRetryMatch.taskId, true);
+    const executedTask = await maybeExecuteTask(
+      database,
+      config,
+      taskRetryMatch.taskId,
+      "retry",
+      piRuntime,
+    );
 
     return jsonResponse(request, config, 200, executedTask);
+  }
+
+  const approveMatch = matchApprovalApprove(url.pathname);
+
+  if (request.method === "POST" && approveMatch) {
+    const body = await readJsonBody(request);
+
+    if (body !== null && !isApprovalDecisionBody(body)) {
+      return jsonResponse(request, config, 400, {
+        error: "Approval decisions must be a JSON object with an optional string decided_by field.",
+      });
+    }
+
+    const approval = getApproval(database, approveMatch.approvalId);
+
+    if (!approval) {
+      return jsonResponse(request, config, 404, {
+        error: `Approval '${approveMatch.approvalId}' was not found.`,
+      });
+    }
+
+    if (approval.status !== "pending") {
+      return jsonResponse(request, config, 409, {
+        error: `Approval '${approveMatch.approvalId}' has already been resolved.`,
+      });
+    }
+
+    const decisionBody: ApprovalDecisionBody = body && isApprovalDecisionBody(body) ? body : {};
+    const decidedBy = normalizeDecisionActor(decisionBody.decided_by);
+    const resolved = resolveApproval(database, approveMatch.approvalId, {
+      status: "approved",
+      decided_by: decidedBy,
+      decided_at: new Date().toISOString(),
+    });
+
+    if (!resolved) {
+      return jsonResponse(request, config, 409, {
+        error: `Approval '${approveMatch.approvalId}' was already resolved by another request.`,
+      });
+    }
+
+    const context = getTaskExecutionContext(database, resolved.task_id);
+
+    if (context) {
+      recordAuditEvent(
+        database,
+        context.repository.id,
+        context.task.id,
+        "task.approval.approved",
+        "Approved the pending task action.",
+        {
+          approval_id: resolved.id,
+          approval_type: resolved.approval_type,
+          decided_by: decidedBy,
+        },
+      );
+    }
+
+    const task = await maybeExecuteTask(database, config, resolved.task_id, "resume", piRuntime);
+
+    return jsonResponse(request, config, 200, {
+      approval: resolved,
+      task,
+    });
+  }
+
+  const rejectMatch = matchApprovalReject(url.pathname);
+
+  if (request.method === "POST" && rejectMatch) {
+    const body = await readJsonBody(request);
+
+    if (body !== null && !isApprovalDecisionBody(body)) {
+      return jsonResponse(request, config, 400, {
+        error: "Approval decisions must be a JSON object with an optional string decided_by field.",
+      });
+    }
+
+    const approval = getApproval(database, rejectMatch.approvalId);
+
+    if (!approval) {
+      return jsonResponse(request, config, 404, {
+        error: `Approval '${rejectMatch.approvalId}' was not found.`,
+      });
+    }
+
+    if (approval.status !== "pending") {
+      return jsonResponse(request, config, 409, {
+        error: `Approval '${rejectMatch.approvalId}' has already been resolved.`,
+      });
+    }
+
+    const decisionBody: ApprovalDecisionBody = body && isApprovalDecisionBody(body) ? body : {};
+    const decidedBy = normalizeDecisionActor(decisionBody.decided_by);
+    const resolved = resolveApproval(database, rejectMatch.approvalId, {
+      status: "rejected",
+      decided_by: decidedBy,
+      decided_at: new Date().toISOString(),
+    });
+
+    if (!resolved) {
+      return jsonResponse(request, config, 409, {
+        error: `Approval '${rejectMatch.approvalId}' was already resolved by another request.`,
+      });
+    }
+
+    const context = getTaskExecutionContext(database, resolved.task_id);
+
+    if (context) {
+      updateTaskExecution(database, resolved.task_id, {
+        status: "failed",
+        pi_session_id: context.task.pi_session_id,
+        branch_name: context.task.branch_name,
+        started_at: context.task.started_at,
+        completed_at: new Date().toISOString(),
+      });
+      recordAuditEvent(
+        database,
+        context.repository.id,
+        context.task.id,
+        "task.approval.rejected",
+        "Rejected the pending task action.",
+        {
+          approval_id: resolved.id,
+          approval_type: resolved.approval_type,
+          decided_by: decidedBy,
+        },
+      );
+    }
+
+    return jsonResponse(request, config, 200, {
+      approval: resolved,
+      task: getTaskDetail(database, resolved.task_id),
+    });
   }
 
   return jsonResponse(request, config, 404, {
@@ -517,6 +686,18 @@ function matchTaskRetry(pathname: string) {
   return match ? { taskId: decodeURIComponent(match[1] ?? "") } : null;
 }
 
+function matchApprovalApprove(pathname: string) {
+  const match = /^\/api\/approvals\/([^/]+)\/approve$/.exec(pathname);
+
+  return match ? { approvalId: decodeURIComponent(match[1] ?? "") } : null;
+}
+
+function matchApprovalReject(pathname: string) {
+  const match = /^\/api\/approvals\/([^/]+)\/reject$/.exec(pathname);
+
+  return match ? { approvalId: decodeURIComponent(match[1] ?? "") } : null;
+}
+
 async function readJsonBody(request: Request) {
   try {
     return (await request.json()) as unknown;
@@ -578,6 +759,12 @@ function isCreateTaskBody(value: unknown): value is CreateTaskBody {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isApprovalDecisionBody(value: unknown): value is ApprovalDecisionBody {
+  return (
+    isObject(value) && (value.decided_by === undefined || typeof value.decided_by === "string")
+  );
 }
 
 function normalizePolicyPatch(value: Record<string, unknown>): PolicyPatch {
@@ -729,34 +916,13 @@ async function maybeExecuteTask(
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
   config: ServerConfig,
   taskId: string,
-  isRetry = false,
+  executionReason: "start" | "retry" | "resume" = "start",
+  piRuntime?: { execute: PiExecutor },
 ) {
   const context = getTaskExecutionContext(database, taskId);
 
   if (!context) {
     throw new Error(`Task '${taskId}' was not found for execution.`);
-  }
-
-  if (!canAutoExecuteTask(context.task.goal_type)) {
-    recordAuditEvent(
-      database,
-      context.repository.id,
-      context.task.id,
-      isRetry ? "task.execution.retry_deferred" : "task.execution.deferred",
-      "Execution is deferred until approval-backed write workflows land.",
-      {
-        goal_type: context.task.goal_type,
-        routing_tier: context.task.routing_tier,
-      },
-    );
-
-    const detail = getTaskDetail(database, taskId);
-
-    if (!detail) {
-      throw new Error(`Task '${taskId}' disappeared after deferring execution.`);
-    }
-
-    return detail;
   }
 
   const readDecision = evaluatePolicyAction(context.policy, { kind: "read" });
@@ -789,22 +955,145 @@ async function maybeExecuteTask(
     return detail;
   }
 
+  const approvalRequirement = getApprovalRequirement(context.task.goal_type);
+
+  if (approvalRequirement) {
+    const approvalDecision = evaluatePolicyAction(context.policy, {
+      kind: approvalRequirement.action,
+    });
+
+    if (!approvalDecision.allowed) {
+      updateTaskExecution(database, taskId, {
+        status: "failed",
+        pi_session_id: context.task.pi_session_id,
+        branch_name: context.task.branch_name,
+        started_at: context.task.started_at,
+        completed_at: new Date().toISOString(),
+      });
+      recordAuditEvent(
+        database,
+        context.repository.id,
+        context.task.id,
+        "task.execution.blocked",
+        approvalDecision.reason,
+        {
+          action: approvalRequirement.action,
+        },
+      );
+
+      const detail = getTaskDetail(database, taskId);
+
+      if (!detail) {
+        throw new Error(`Task '${taskId}' disappeared after approval-gated access was denied.`);
+      }
+
+      return detail;
+    }
+
+    if (approvalDecision.requires_approval) {
+      const approvedApproval = getLatestApprovedTaskApproval(
+        database,
+        taskId,
+        approvalRequirement.approval_type,
+      );
+
+      if (!approvedApproval) {
+        const pendingApproval = getPendingTaskApproval(
+          database,
+          taskId,
+          approvalRequirement.approval_type,
+        );
+
+        if (!pendingApproval) {
+          const approval = createApproval(database, {
+            task_id: taskId,
+            approval_type: approvalRequirement.approval_type,
+            requested_action: approvalRequirement.requested_action,
+            requested_payload_json: JSON.stringify({
+              repo_id: context.repository.id,
+              repo_name: context.repository.name,
+              task_id: context.task.id,
+              task_title: context.task.title,
+              goal_type: context.task.goal_type,
+              routing_tier: context.task.routing_tier,
+            }),
+          });
+
+          if (!approval) {
+            throw new Error(`Task '${taskId}' could not create its approval checkpoint.`);
+          }
+
+          recordAuditEvent(
+            database,
+            context.repository.id,
+            context.task.id,
+            "task.approval.requested",
+            "Task execution paused for an approval-gated action.",
+            {
+              approval_id: approval.id,
+              approval_type: approval.approval_type,
+              action: approvalRequirement.action,
+            },
+          );
+        }
+
+        updateTaskExecution(database, taskId, {
+          status: "awaiting_approval",
+          pi_session_id: context.task.pi_session_id,
+          branch_name: context.task.branch_name,
+          started_at: context.task.started_at,
+          completed_at: null,
+        });
+
+        const detail = getTaskDetail(database, taskId);
+
+        if (!detail) {
+          throw new Error(`Task '${taskId}' disappeared while waiting for approval.`);
+        }
+
+        return detail;
+      }
+    }
+  }
+
   const startedAt = new Date().toISOString();
-  updateTaskExecution(database, taskId, {
-    status: "running",
-    pi_session_id: context.task.pi_session_id,
-    branch_name: context.task.branch_name,
-    started_at: startedAt,
-    completed_at: null,
-  });
+  const claimedExecution = claimTaskExecution(
+    database,
+    taskId,
+    executionStartStatusesForReason(executionReason),
+    {
+      status: "running",
+      pi_session_id: context.task.pi_session_id,
+      branch_name: context.task.branch_name,
+      started_at: startedAt,
+      completed_at: null,
+    },
+  );
+
+  if (!claimedExecution) {
+    const detail = getTaskDetail(database, taskId);
+
+    if (!detail) {
+      throw new Error(`Task '${taskId}' disappeared while another request claimed execution.`);
+    }
+
+    return detail;
+  }
+
   recordAuditEvent(
     database,
     context.repository.id,
     context.task.id,
-    isRetry ? "task.execution.retried" : "task.execution.started",
-    isRetry
-      ? "Retried task execution through the milestone-three runner."
-      : "Started task execution through the milestone-three runner.",
+    executionReason === "retry"
+      ? "task.execution.retried"
+      : executionReason === "resume"
+        ? "task.execution.resumed"
+        : "task.execution.started",
+    executionReason === "retry"
+      ? "Retried task execution through the pi runner."
+      : executionReason === "resume"
+        ? "Resumed task execution after approval."
+        : "Started task execution through the pi runner.",
     {
       goal_type: context.task.goal_type,
       routing_tier: context.task.routing_tier,
@@ -813,7 +1102,7 @@ async function maybeExecuteTask(
 
   try {
     const executionRequest = buildPiExecutionRequest(config, context);
-    const result = await executePiTask(executionRequest);
+    const result = await executePiTask(executionRequest, piRuntime);
 
     replaceTaskArtifacts(
       database,
@@ -873,10 +1162,6 @@ async function maybeExecuteTask(
   return detail;
 }
 
-function canAutoExecuteTask(goalType: TaskGoalType) {
-  return goalType === "question" || goalType === "plan";
-}
-
 function buildPiExecutionRequest(
   config: ServerConfig,
   context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
@@ -892,6 +1177,10 @@ function buildPiExecutionRequest(
     policy: {
       allowed_root: context.policy.allowed_root,
       autonomy_mode: context.policy.autonomy_mode,
+      allow_read: context.policy.allow_read,
+      allow_edit: context.policy.allow_edit,
+      allow_bash: context.policy.allow_bash,
+      approval_required_for_risky_bash: context.policy.approval_required_for_risky_bash,
       max_task_budget_usd: context.policy.max_task_budget_usd,
     },
     task: {
@@ -971,6 +1260,35 @@ function parseGithubRemote(remoteUrl: string | null) {
     owner: match[1] ?? null,
     repo: repo || null,
   };
+}
+
+function getApprovalRequirement(goalType: TaskGoalType) {
+  if (goalType === "question" || goalType === "plan") {
+    return null;
+  }
+
+  return {
+    action: "edit" as const,
+    approval_type: "edit" as const,
+    requested_action: "Allow repository edits for this task.",
+  };
+}
+
+function executionStartStatusesForReason(executionReason: "start" | "retry" | "resume") {
+  switch (executionReason) {
+    case "start":
+      return ["queued"] as const;
+    case "retry":
+      return ["queued", "failed", "completed"] as const;
+    case "resume":
+      return ["awaiting_approval"] as const;
+  }
+}
+
+function normalizeDecisionActor(value: string | undefined) {
+  const trimmed = value?.trim();
+
+  return trimmed ? trimmed : null;
 }
 
 function toAutonomyMode(value: string): AutonomyMode {

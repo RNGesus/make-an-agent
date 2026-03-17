@@ -11,6 +11,7 @@
     "test": "vp test"
   },
   "dependencies": {
+    "@mariozechner/pi-coding-agent": "catalog:",
     "shared": "workspace:*"
   },
   "devDependencies": {

@@ -24,6 +24,10 @@ test("dirty files modified again during execution are still attributed to the ta
       policy: {
         allowed_root: repoRoot,
         autonomy_mode: "approve-writes",
+        allow_read: true,
+        allow_edit: true,
+        allow_bash: true,
+        approval_required_for_risky_bash: true,
         max_task_budget_usd: 10,
       },
       task: {

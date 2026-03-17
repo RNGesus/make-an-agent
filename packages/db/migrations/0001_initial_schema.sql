@@ -114,5 +114,8 @@ CREATE INDEX IF NOT EXISTS tasks_repo_created_idx ON tasks(repo_id, created_at D
 CREATE INDEX IF NOT EXISTS tasks_status_created_idx ON tasks(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS task_artifacts_task_idx ON task_artifacts(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS approvals_status_created_idx ON approvals(status, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS approvals_pending_task_type_idx
+ON approvals(task_id, approval_type)
+WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS audit_events_repo_created_idx ON audit_events(repo_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_task_created_idx ON audit_events(task_id, created_at DESC);

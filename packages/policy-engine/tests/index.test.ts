@@ -39,14 +39,16 @@ test("allows safe bash commands without blocking them", () => {
   expect(decision.allowed).toBe(true);
 });
 
-test("blocks commands outside the allowed patterns when marked risky", () => {
+test("marks risky bash commands as approval-gated instead of blocking them outright", () => {
   const decision = evaluatePolicyAction(basePolicy, {
     kind: "bash",
     command: "rm -rf tmp",
     risky: true,
   });
 
-  expect(decision.allowed).toBe(false);
+  expect(decision.allowed).toBe(true);
+  expect(decision.requires_approval).toBe(true);
+  expect(decision.reason).toContain("requires approval");
 });
 
 test("fails closed when a safe command pattern is invalid", () => {

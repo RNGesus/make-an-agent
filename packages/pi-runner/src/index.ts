@@ -1,7 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
+import {
+  SessionManager,
+  createAgentSession,
+  createBashTool,
+  createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createReadTool,
+  createWriteTool,
+} from "@mariozechner/pi-coding-agent";
 import type {
   ArtifactType,
   RepositoryPolicyRecord,
@@ -29,7 +40,16 @@ interface GitSnapshot {
 export interface PiExecutionRequest {
   mode: PiRunnerMode;
   repo: Pick<RepositoryRecord, "id" | "name" | "root_path" | "default_branch">;
-  policy: Pick<RepositoryPolicyRecord, "allowed_root" | "autonomy_mode" | "max_task_budget_usd">;
+  policy: Pick<
+    RepositoryPolicyRecord,
+    | "allowed_root"
+    | "autonomy_mode"
+    | "max_task_budget_usd"
+    | "allow_read"
+    | "allow_edit"
+    | "allow_bash"
+    | "approval_required_for_risky_bash"
+  >;
   task: Pick<TaskRecord, "id" | "title" | "user_prompt" | "goal_type">;
   routing_tier: RoutingTier;
   model_profile: {
@@ -42,6 +62,10 @@ export interface PiExecutionEnvelope {
   mode: PiRunnerMode;
   session_key: string;
   workspace_root: string;
+  allow_read: boolean;
+  allow_edit: boolean;
+  allow_bash: boolean;
+  approval_required_for_risky_bash: boolean;
   artifact_targets: readonly string[];
   approval_checkpoints: readonly string[];
   provider: string;
@@ -73,6 +97,8 @@ export interface PiExecutionResult {
 export interface PiExecutorOutput {
   final_answer: string;
   execution_notes?: readonly string[];
+  session_id?: string;
+  session_file?: string | null;
 }
 
 export type PiExecutor = (
@@ -84,11 +110,20 @@ export interface PiRunnerRuntime {
   now?: () => Date;
 }
 
+interface PiSessionState {
+  session_id: string;
+  session_file: string | null;
+}
+
 export function createPiExecutionEnvelope(request: PiExecutionRequest): PiExecutionEnvelope {
   return {
     mode: request.mode,
     session_key: `${request.repo.id}:${request.task.id}`,
     workspace_root: request.policy.allowed_root,
+    allow_read: request.policy.allow_read,
+    allow_edit: request.policy.allow_edit,
+    allow_bash: request.policy.allow_bash,
+    approval_required_for_risky_bash: request.policy.approval_required_for_risky_bash,
     artifact_targets: ["final_answer", "changed_files", "diff_summary", "execution_notes"],
     approval_checkpoints: ["edit", "risky_bash", "commit", "pull_request"],
     provider: request.model_profile.provider,
@@ -109,18 +144,19 @@ export async function executePiTask(
   runtime: PiRunnerRuntime = {},
 ): Promise<PiExecutionResult> {
   const envelope = createPiExecutionEnvelope(request);
-  const executor = runtime.execute ?? defaultPiExecutor;
+  const executor = runtime.execute ?? livePiExecutor;
   const beforeGitArtifacts = captureGitArtifacts(envelope.workspace_root);
   const execution = await executor(envelope);
   const afterGitArtifacts = captureGitArtifacts(envelope.workspace_root);
   const gitArtifacts = summarizeGitDelta(beforeGitArtifacts, afterGitArtifacts);
   const finalAnswer = execution.final_answer.trim();
-  const sessionId = `pi-${request.mode}:${randomUUID()}`;
+  const sessionId = execution.session_id ?? `pi-${request.mode}:${randomUUID()}`;
   const notes = [
     `Execution mode: ${request.mode}.`,
     `Selected model: ${request.model_profile.provider}/${request.model_profile.model}.`,
     `Workspace root: ${envelope.workspace_root}.`,
     `Routing tier: ${request.routing_tier}.`,
+    ...(execution.session_file ? [`Session file: ${execution.session_file}.`] : []),
     ...(execution.execution_notes ?? []),
   ];
 
@@ -175,19 +211,187 @@ export async function executePiTask(
   };
 }
 
-function defaultPiExecutor(envelope: PiExecutionEnvelope): PiExecutorOutput {
+async function livePiExecutor(envelope: PiExecutionEnvelope): Promise<PiExecutorOutput> {
+  return envelope.mode === "sdk" ? executeWithSdk(envelope) : executeWithRpc(envelope);
+}
+
+async function executeWithSdk(envelope: PiExecutionEnvelope): Promise<PiExecutorOutput> {
+  const sessionState = createPiSessionState(envelope.workspace_root);
+  const { session } = await createAgentSession({
+    cwd: envelope.workspace_root,
+    sessionManager: SessionManager.open(sessionState.session_file ?? ""),
+    tools: createPiTools(envelope),
+  });
+  const selectedModel = session.modelRegistry.find(envelope.provider, envelope.model);
+
+  if (!selectedModel) {
+    session.dispose();
+    throw new Error(`Pi could not resolve model '${envelope.provider}/${envelope.model}'.`);
+  }
+
+  await session.setModel(selectedModel);
+
+  try {
+    await session.prompt(buildPiTaskPrompt(envelope));
+    await waitForAgentIdle(session);
+    const stats = session.getSessionStats();
+
+    return {
+      final_answer:
+        session.getLastAssistantText()?.trim() ||
+        `Pi completed '${envelope.task_title}' without returning assistant text.`,
+      execution_notes: [
+        `SDK session ${session.sessionId} persisted for ${envelope.repo_name}.`,
+        stats.toolCalls === 0
+          ? "The agent answered without calling any tools."
+          : `The agent executed ${stats.toolCalls} tool call(s).`,
+      ],
+      session_id: `pi-sdk:${session.sessionId}`,
+      session_file: session.sessionFile ?? sessionState.session_file,
+    };
+  } finally {
+    session.dispose();
+  }
+}
+
+async function executeWithRpc(envelope: PiExecutionEnvelope): Promise<PiExecutorOutput> {
+  const sessionState = createPiSessionState(envelope.workspace_root);
+  const prompt = buildPiTaskPrompt(envelope);
+  const args = [
+    "--print",
+    "--session",
+    sessionState.session_file ?? "",
+    "--provider",
+    envelope.provider,
+    "--model",
+    envelope.model,
+    "--tools",
+    buildRpcToolsArgument(envelope),
+    prompt,
+  ];
+  const result = await runPiCommand(args, envelope.workspace_root);
+
+  if (result.exit_code !== 0) {
+    throw new Error(result.stderr || result.stdout || `pi exited with status ${result.exit_code}.`);
+  }
+
   return {
-    final_answer: [
-      `Mock ${envelope.mode.toUpperCase()} pi session for '${envelope.task_title}' completed.`,
-      `The control plane persisted a session reference for ${envelope.repo_name}`,
-      `using ${envelope.provider}/${envelope.model} on the ${envelope.routing_tier} tier.`,
-      `This placeholder keeps Milestone 3 executable until the live pi binary or SDK is wired in.`,
-    ].join(" "),
+    final_answer:
+      result.stdout.trim() ||
+      `Pi completed '${envelope.task_title}' without returning assistant text.`,
     execution_notes: [
-      `Task goal type '${envelope.task_goal_type}' ran through the milestone-three wrapper.`,
-      "The default executor is deterministic and read-only.",
+      `RPC CLI session ${sessionState.session_id} persisted for ${envelope.repo_name}.`,
+      ...(result.stderr.trim() ? [`pi stderr: ${result.stderr.trim()}`] : []),
     ],
+    session_id: `pi-rpc:${sessionState.session_id}`,
+    session_file: sessionState.session_file,
   };
+}
+
+function createPiSessionState(workspaceRoot: string): PiSessionState {
+  const sessionManager = SessionManager.create(workspaceRoot);
+
+  return {
+    session_id: sessionManager.getSessionId(),
+    session_file: sessionManager.getSessionFile() ?? null,
+  };
+}
+
+function createPiTools(envelope: PiExecutionEnvelope) {
+  const tools = [];
+  const allowBashTools = envelope.allow_bash && !envelope.approval_required_for_risky_bash;
+  const allowEditTools =
+    envelope.allow_edit &&
+    envelope.task_goal_type !== "question" &&
+    envelope.task_goal_type !== "plan";
+
+  if (envelope.allow_read) {
+    tools.push(
+      createReadTool(envelope.workspace_root),
+      createGrepTool(envelope.workspace_root),
+      createFindTool(envelope.workspace_root),
+      createLsTool(envelope.workspace_root),
+    );
+  }
+
+  if (allowBashTools) {
+    tools.push(createBashTool(envelope.workspace_root));
+  }
+
+  if (allowEditTools) {
+    tools.push(createEditTool(envelope.workspace_root), createWriteTool(envelope.workspace_root));
+  }
+
+  return tools;
+}
+
+function buildRpcToolsArgument(envelope: PiExecutionEnvelope) {
+  const toolNames = envelope.allow_read ? ["read", "grep", "find", "ls"] : [];
+
+  if (
+    envelope.allow_edit &&
+    envelope.task_goal_type !== "question" &&
+    envelope.task_goal_type !== "plan"
+  ) {
+    toolNames.push("edit", "write");
+  }
+
+  if (envelope.allow_bash && !envelope.approval_required_for_risky_bash) {
+    toolNames.push("bash");
+  }
+
+  return toolNames.join(",");
+}
+
+function buildPiTaskPrompt(envelope: PiExecutionEnvelope) {
+  return [
+    `Repository: ${envelope.repo_name}`,
+    `Workspace root: ${envelope.workspace_root}`,
+    `Default branch: ${envelope.default_branch}`,
+    `Task title: ${envelope.task_title}`,
+    `Goal type: ${envelope.task_goal_type}`,
+    `Routing tier: ${envelope.routing_tier}`,
+    "Stay inside the workspace root and use repository-aware tools when needed.",
+    "User request:",
+    envelope.task_prompt,
+  ].join("\n\n");
+}
+
+async function waitForAgentIdle(
+  session: Awaited<ReturnType<typeof createAgentSession>>["session"],
+) {
+  const agent = session.agent as { waitForIdle?: () => Promise<void> };
+
+  if (!agent.waitForIdle) {
+    throw new Error("Pi SDK agent does not expose waitForIdle().");
+  }
+
+  await agent.waitForIdle();
+}
+
+async function runPiCommand(args: string[], cwd: string) {
+  return new Promise<{ stdout: string; stderr: string; exit_code: number | null }>(
+    (resolve, reject) => {
+      const child = spawn("pi", args, {
+        cwd,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", (chunk: Buffer | string) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk: Buffer | string) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", reject);
+      child.on("close", (exitCode) => {
+        resolve({ stdout, stderr, exit_code: exitCode });
+      });
+    },
+  );
 }
 
 function captureGitArtifacts(workspaceRoot: string): GitSnapshot {

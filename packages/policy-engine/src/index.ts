@@ -58,20 +58,24 @@ export function evaluatePolicyAction(
         }
       });
       const safeMatch = commandMatchesAllowedPattern(action.command, policy.safe_command_patterns);
-      const allowed = policy.allow_bash && (safeMatch || !action.risky);
+      const requiresApproval =
+        policy.allow_bash &&
+        (Boolean(action.risky) || !safeMatch) &&
+        policy.approval_required_for_risky_bash;
+      const allowed = !hasInvalidPattern && policy.allow_bash;
 
       return {
-        allowed: hasInvalidPattern ? false : allowed,
-        requires_approval:
-          !hasInvalidPattern &&
-          allowed &&
-          (!safeMatch || Boolean(action.risky)) &&
-          policy.approval_required_for_risky_bash,
+        allowed,
+        requires_approval: !hasInvalidPattern && requiresApproval,
         reason: hasInvalidPattern
           ? "Bash policy contains an invalid safe-command pattern and must be corrected before execution."
-          : allowed
-            ? "Bash action is permitted within the repo policy."
-            : "Bash command is outside the allowed policy patterns.",
+          : !policy.allow_bash
+            ? "Bash access is disabled by repo policy."
+            : requiresApproval
+              ? "Bash action is allowed but requires approval under the repo policy."
+              : safeMatch
+                ? "Bash action matches a safe command policy and may run automatically."
+                : "Bash action is permitted within the repo policy.",
       };
     }
     case "git_write":
