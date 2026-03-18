@@ -205,8 +205,15 @@ function TaskDetailContent(props: {
     base_branch?: string;
     body?: string;
     compare_url?: string | null;
+    created_at?: string;
+    draft?: boolean;
+    error?: string | null;
     head_branch?: string;
     head_sha?: string;
+    pr_number?: number | null;
+    pr_url?: string | null;
+    provider?: "github" | "local";
+    state?: string;
     status?: string;
     title?: string;
   }>(artifacts, "pr_metadata");
@@ -306,8 +313,15 @@ function BranchStatusCard(props: {
     base_branch?: string;
     body?: string;
     compare_url?: string | null;
+    created_at?: string;
+    draft?: boolean;
+    error?: string | null;
     head_branch?: string;
     head_sha?: string;
+    pr_number?: number | null;
+    pr_url?: string | null;
+    provider?: "github" | "local";
+    state?: string;
     status?: string;
     title?: string;
   } | null;
@@ -365,8 +379,30 @@ function BranchStatusCard(props: {
 
       {props.pullRequestMetadata ? (
         <div className="routing-callout">
-          <p className="eyebrow">Pull request draft</p>
-          <p>{props.pullRequestMetadata.title ?? "PR draft prepared"}</p>
+          <p className="eyebrow">
+            {props.pullRequestMetadata.provider === "github"
+              ? "GitHub pull request"
+              : "Pull request fallback"}
+          </p>
+          <p>{props.pullRequestMetadata.title ?? "Pull request metadata prepared"}</p>
+          <p>
+            {props.pullRequestMetadata.provider === "github"
+              ? `#${props.pullRequestMetadata.pr_number ?? "?"} · ${props.pullRequestMetadata.draft ? "Draft" : "Ready"} · ${props.pullRequestMetadata.state ?? "open"}`
+              : props.pullRequestMetadata.status === "drafted_fallback"
+                ? "Stored local fallback metadata because GitHub PR creation did not complete."
+                : "Stored local pull request metadata."}
+          </p>
+          {props.pullRequestMetadata.error ? <p>{props.pullRequestMetadata.error}</p> : null}
+          {props.pullRequestMetadata.pr_url ? (
+            <a
+              className="ghost-button action-link"
+              href={props.pullRequestMetadata.pr_url}
+              rel="noreferrer"
+              target="_blank"
+            >
+              Open pull request
+            </a>
+          ) : null}
           {props.pullRequestMetadata.compare_url ? (
             <a
               className="ghost-button action-link"
@@ -403,7 +439,7 @@ function BranchStatusCard(props: {
           onClick={() => void props.onCreatePullRequest(props.task.id)}
           type="button"
         >
-          Create PR draft
+          Create PR
         </button>
       </form>
 

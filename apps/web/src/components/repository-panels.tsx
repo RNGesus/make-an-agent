@@ -12,6 +12,7 @@ type RepositoryLibraryPanelProps = {
 type WorkspaceScanPanelProps = {
   candidates: RepositoryScanCandidate[];
   onImport: (rootPath: string, parentSource: string) => Promise<void>;
+  warning: string | null;
 };
 
 export function RepositoryLibraryPanel(props: RepositoryLibraryPanelProps) {
@@ -82,7 +83,8 @@ export function WorkspaceScanPanel(props: WorkspaceScanPanelProps) {
       <div className="candidate-list">
         {props.candidates.length === 0 ? (
           <p className="empty-state">
-            No git repositories were found under the configured workspace parent.
+            {props.warning ??
+              "No git repositories were found under the configured workspace parent."}
           </p>
         ) : (
           props.candidates.map((candidate) => (

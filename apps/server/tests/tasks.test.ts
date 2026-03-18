@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, expect, test } from "vite-plus/test";
+import type { GitHubPullRequestCreator } from "github";
 import { PiCommandApprovalRequiredError, type PiExecutor } from "pi-runner";
 import { createServerApp } from "../src/app.ts";
 
@@ -743,12 +744,20 @@ test("commit requests can require approval and execute after approval", async ()
   expect(diff.has_changes).toBe(false);
 });
 
-test("trusted task branches can prepare a pull request draft after commit", async () => {
+test("trusted task branches can create a real GitHub draft pull request after commit", async () => {
   const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
   const repoRoot = createGitRepository(workspaceRoot, "tasks-nu");
   const app = createApp(workspaceRoot, {
+    githubCreatePullRequest: async () => ({
+      draft: true,
+      head_sha: "abcdef1234567890",
+      number: 27,
+      state: "open",
+      url: "https://github.com/test/tasks-nu/pull/27",
+    }),
+    githubToken: "test-token",
     piExecute(envelope) {
-      writeFileSync(join(repoRoot, "README.md"), "# tasks-nu\nReady for PR draft\n");
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-nu\nReady for PR creation\n");
 
       return {
         final_answer: `Stub ${envelope.mode.toUpperCase()} pi session for '${envelope.task_title}' completed.`,
@@ -766,7 +775,7 @@ test("trusted task branches can prepare a pull request draft after commit", asyn
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         repo_id: repoId,
-        title: "Implement PR drafting",
+        title: "Implement PR creation",
         user_prompt: "Implement the requested repository change",
         goal_type: "implement",
       }),
@@ -811,18 +820,224 @@ test("trusted task branches can prepare a pull request draft after commit", asyn
 
   expect(prResponse.status).toBe(200);
   expect(drafted.approval).toBeNull();
-  expect(
-    drafted.task.artifacts.find((artifact) => artifact.artifact_type === "pr_metadata"),
-  ).toBeTruthy();
-  expect(
-    JSON.parse(
-      drafted.task.artifacts.find((artifact) => artifact.artifact_type === "pr_metadata")
-        ?.payload_json ?? "{}",
-    ),
-  ).toMatchObject({
-    status: "drafted",
-    title: "Implement PR drafting",
+  expect(readArtifactPayload(drafted.task.artifacts, "pr_metadata")).toMatchObject({
+    draft: true,
+    pr_number: 27,
+    pr_url: "https://github.com/test/tasks-nu/pull/27",
+    provider: "github",
+    state: "open",
+    status: "open",
+    title: "Implement PR creation",
   });
+});
+
+test("pull request creation falls back to local draft metadata when the GitHub token is missing", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-xi");
+  const app = createApp(workspaceRoot, {
+    piExecute() {
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-xi\nFallback draft\n");
+
+      return {
+        final_answer: "Completed with local fallback.",
+        session_id: "pi-rpc:tasks-xi",
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+
+  await updatePolicy(app, repoId, { autonomy_mode: "trusted" });
+
+  const createdTaskId = await createCompletedTask(app, repoId, "Prepare fallback PR");
+  await commitTask(app, createdTaskId, "Commit fallback task changes");
+
+  const prResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${createdTaskId}/pr`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+  );
+  const payload = (await prResponse.json()) as {
+    approval: null;
+    task: {
+      artifacts: Array<{ artifact_type: string; payload_json: string }>;
+      audit_events: Array<{ event_type: string }>;
+    };
+  };
+
+  expect(prResponse.status).toBe(200);
+  expect(payload.approval).toBeNull();
+  expect(readArtifactPayload(payload.task.artifacts, "pr_metadata")).toMatchObject({
+    error: "GITHUB_TOKEN is not configured on the server.",
+    provider: "local",
+    status: "drafted_fallback",
+  });
+  expect(payload.task.audit_events.map((event) => event.event_type)).toEqual(
+    expect.arrayContaining(["task.git.pushed", "task.git.pr_fallback", "task.git.pr_drafted"]),
+  );
+});
+
+test("pull request creation falls back to local draft metadata when GitHub creation fails", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-omicron");
+  const app = createApp(workspaceRoot, {
+    githubCreatePullRequest: async () => {
+      throw new Error("GitHub API rejected the draft PR.");
+    },
+    githubToken: "test-token",
+    piExecute() {
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-omicron\nFallback after API error\n");
+
+      return {
+        final_answer: "Completed with GitHub fallback.",
+        session_id: "pi-rpc:tasks-omicron",
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+
+  await updatePolicy(app, repoId, { autonomy_mode: "trusted" });
+
+  const createdTaskId = await createCompletedTask(app, repoId, "Prepare errored PR");
+  await commitTask(app, createdTaskId, "Commit errored PR task changes");
+
+  const prResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${createdTaskId}/pr`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+  );
+  const payload = (await prResponse.json()) as {
+    task: {
+      artifacts: Array<{ artifact_type: string; payload_json: string }>;
+      audit_events: Array<{ event_type: string }>;
+    };
+  };
+
+  expect(prResponse.status).toBe(200);
+  expect(readArtifactPayload(payload.task.artifacts, "pr_metadata")).toMatchObject({
+    error: "GitHub API rejected the draft PR.",
+    provider: "local",
+    status: "drafted_fallback",
+  });
+  expect(payload.task.audit_events.map((event) => event.event_type)).toEqual(
+    expect.arrayContaining(["task.git.pushed", "task.git.pr_fallback", "task.git.pr_drafted"]),
+  );
+});
+
+test("approval-gated pull request creation creates a real GitHub PR after approval", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-pi");
+  const app = createApp(workspaceRoot, {
+    githubCreatePullRequest: async () => ({
+      draft: true,
+      head_sha: "1234567890abcdef",
+      number: 44,
+      state: "open",
+      url: "https://github.com/test/tasks-pi/pull/44",
+    }),
+    githubToken: "test-token",
+    piExecute() {
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-pi\nApproval gated PR\n");
+
+      return {
+        final_answer: "Completed with approval-gated PR.",
+        session_id: "pi-rpc:tasks-pi",
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+
+  await updatePolicy(app, repoId, {
+    autonomy_mode: "trusted",
+    approval_required_for_pr: true,
+  });
+
+  const createdTaskId = await createCompletedTask(app, repoId, "Create approved PR");
+  await commitTask(app, createdTaskId, "Commit approved PR task changes");
+
+  const requestResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${createdTaskId}/pr`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+  );
+  const requested = (await requestResponse.json()) as {
+    approval: { id: string; approval_type: string; status: string };
+    task: { artifacts: Array<{ artifact_type: string }> };
+  };
+
+  expect(requestResponse.status).toBe(200);
+  expect(requested.approval).toMatchObject({ approval_type: "pull_request", status: "pending" });
+  expect(requested.task.artifacts.map((artifact) => artifact.artifact_type)).not.toContain(
+    "pr_metadata",
+  );
+
+  const approveResponse = await app.handleRequest(
+    new Request(`http://localhost/api/approvals/${requested.approval.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decided_by: "operator" }),
+    }),
+  );
+  const approved = (await approveResponse.json()) as {
+    approval: { status: string };
+    task: { artifacts: Array<{ artifact_type: string; payload_json: string }> };
+  };
+
+  expect(approveResponse.status).toBe(200);
+  expect(approved.approval.status).toBe("approved");
+  expect(readArtifactPayload(approved.task.artifacts, "pr_metadata")).toMatchObject({
+    pr_number: 44,
+    provider: "github",
+    status: "open",
+  });
+});
+
+test("pull request creation fails when the task branch cannot be pushed to origin", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const repoRoot = createGitRepository(workspaceRoot, "tasks-rho", {
+    pushUrl: join(workspaceRoot, "missing-remote.git"),
+  });
+  const app = createApp(workspaceRoot, {
+    githubCreatePullRequest: async () => ({
+      draft: true,
+      head_sha: "should-not-run",
+      number: 88,
+      state: "open",
+      url: "https://github.com/test/tasks-rho/pull/88",
+    }),
+    githubToken: "test-token",
+    piExecute() {
+      writeFileSync(join(repoRoot, "README.md"), "# tasks-rho\nPush failure\n");
+
+      return {
+        final_answer: "Completed before push failure.",
+        session_id: "pi-rpc:tasks-rho",
+      };
+    },
+  });
+  const repoId = await registerRepository(app, repoRoot);
+
+  await updatePolicy(app, repoId, { autonomy_mode: "trusted" });
+
+  const createdTaskId = await createCompletedTask(app, repoId, "Fail PR push");
+  await commitTask(app, createdTaskId, "Commit push failure task changes");
+
+  const prResponse = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${createdTaskId}/pr`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+  );
+  const payload = (await prResponse.json()) as { error: string };
+
+  expect(prResponse.status).toBe(400);
+  expect(payload.error).toContain("Could not push task branch");
 });
 
 test("task creation rejects unknown repositories", async () => {
@@ -849,11 +1064,15 @@ function createApp(
   workspaceRoot: string,
   options: {
     piExecute?: PiExecutor;
+    githubCreatePullRequest?: GitHubPullRequestCreator;
+    githubToken?: string | null;
   } = {},
 ) {
   const app = createServerApp({
     workspace_parent_dir: workspaceRoot,
     database_path: join(workspaceRoot, ".data", "control-plane.sqlite"),
+    github_create_pull_request: options.githubCreatePullRequest,
+    github_token: options.githubToken ?? null,
     pi_execute: options.piExecute ?? createStubPiExecutor(),
   });
 
@@ -902,8 +1121,13 @@ function createStubPiExecutor(): PiExecutor {
 function createGitRepository(
   workspaceRoot: string,
   name: string,
-  remoteUrl = `git@github.com:test/${name}.git`,
+  options: {
+    remoteUrl?: string;
+    pushUrl?: string | null;
+  } = {},
 ) {
+  const remoteUrl = options.remoteUrl ?? `git@github.com:test/${name}.git`;
+  const pushUrl = options.pushUrl ?? createBareGitRemote(workspaceRoot, name);
   const repoRoot = join(workspaceRoot, name);
   mkdirSync(repoRoot, { recursive: true });
   writeFileSync(join(repoRoot, "README.md"), `# ${name}\n`);
@@ -914,8 +1138,69 @@ function createGitRepository(
   runGit(repoRoot, ["add", "."]);
   runGit(repoRoot, ["commit", "-m", "Initial commit"]);
   runGit(repoRoot, ["remote", "add", "origin", remoteUrl]);
+  if (pushUrl) {
+    runGit(repoRoot, ["remote", "set-url", "--push", "origin", pushUrl]);
+  }
 
   return repoRoot;
+}
+
+function createBareGitRemote(workspaceRoot: string, name: string) {
+  const remoteRoot = join(workspaceRoot, `${name}-remote.git`);
+
+  runGit(workspaceRoot, ["init", "--bare", remoteRoot]);
+
+  return remoteRoot;
+}
+
+async function createCompletedTask(
+  app: ReturnType<typeof createServerApp>,
+  repoId: string,
+  title: string,
+) {
+  const response = await app.handleRequest(
+    new Request("http://localhost/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repo_id: repoId,
+        title,
+        user_prompt: "Implement the requested repository change",
+        goal_type: "implement",
+      }),
+    }),
+  );
+  const payload = (await response.json()) as { task: { id: string; status: string } };
+
+  expect(response.status).toBe(201);
+  expect(payload.task.status).toBe("completed");
+
+  return payload.task.id;
+}
+
+async function commitTask(
+  app: ReturnType<typeof createServerApp>,
+  taskId: string,
+  message: string,
+) {
+  const response = await app.handleRequest(
+    new Request(`http://localhost/api/tasks/${taskId}/commit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message }),
+    }),
+  );
+
+  expect(response.status).toBe(200);
+}
+
+function readArtifactPayload(
+  artifacts: Array<{ artifact_type: string; payload_json: string }>,
+  artifactType: string,
+) {
+  return JSON.parse(
+    artifacts.find((artifact) => artifact.artifact_type === artifactType)?.payload_json ?? "{}",
+  ) as Record<string, unknown>;
 }
 
 function runGit(rootPath: string, args: string[]) {

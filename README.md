@@ -26,6 +26,8 @@ vp run build -r
 
 The server now exposes a real HTTP entrypoint on `http://127.0.0.1:4310` by default, serves the built web app from `apps/web/dist`, and stores Milestone 3 execution artifacts for read-only tasks.
 
+Copy [`.env.example`](./make-an-agent/.env.example) to `.env` or export the same variables in your shell before starting the server. `GITHUB_TOKEN` enables real GitHub pull request creation for the milestone 6 workflow.
+
 ## Schema
 
 The initial SQLite schema lives at `packages/db/migrations/0001_initial_schema.sql` and covers:

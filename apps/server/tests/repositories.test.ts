@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -34,6 +34,7 @@ test("repo scan discovers immediate child git repositories", async () => {
       default_branch: string;
       github_repo: string | null;
     }>;
+    warning: string | null;
   };
 
   expect(response.status).toBe(200);
@@ -45,6 +46,47 @@ test("repo scan discovers immediate child git repositories", async () => {
     default_branch: "main",
     github_repo: "alpha.service",
   });
+  expect(payload.warning).toBeNull();
+});
+
+test("server bootstrap creates a missing workspace parent directory", async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const workspaceRoot = join(tempRoot, "srv", "agent-workspaces");
+  const app = createApp(workspaceRoot, join(tempRoot, ".data", "control-plane.sqlite"));
+
+  expect(existsSync(workspaceRoot)).toBe(true);
+
+  const response = await app.handleRequest(
+    new Request("http://localhost/api/repos/scan", { method: "POST" }),
+  );
+  const payload = (await response.json()) as {
+    candidates: unknown[];
+    warning: string | null;
+  };
+
+  expect(response.status).toBe(200);
+  expect(payload.candidates).toEqual([]);
+  expect(payload.warning).toBeNull();
+});
+
+test("repo scan returns a warning when the workspace parent is not a directory", async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), "pi-remote-control-workspaces-"));
+  const workspacePath = join(tempRoot, "workspace-parent");
+
+  writeFileSync(workspacePath, "not a directory");
+
+  const app = createApp(workspacePath, join(tempRoot, ".data", "control-plane.sqlite"));
+  const response = await app.handleRequest(
+    new Request("http://localhost/api/repos/scan", { method: "POST" }),
+  );
+  const payload = (await response.json()) as {
+    candidates: unknown[];
+    warning: string | null;
+  };
+
+  expect(response.status).toBe(200);
+  expect(payload.candidates).toEqual([]);
+  expect(payload.warning).toContain("not a directory");
 });
 
 test("repo registration persists repository rows and default policy", async () => {
@@ -195,10 +237,13 @@ test("policy patch rejects allowed_root outside the repository", async () => {
   expect(patchPayload.error).toContain("must stay inside");
 });
 
-function createApp(workspaceRoot: string) {
+function createApp(
+  workspaceRoot: string,
+  databasePath = join(workspaceRoot, ".data", "control-plane.sqlite"),
+) {
   const app = createServerApp({
     workspace_parent_dir: workspaceRoot,
-    database_path: join(workspaceRoot, ".data", "control-plane.sqlite"),
+    database_path: databasePath,
   });
 
   apps.push(app);

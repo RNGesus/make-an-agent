@@ -56,6 +56,12 @@ export type RepositoryScanCandidate = {
   root_path: string;
 };
 
+export type WorkspaceScanResponse = {
+  candidates: RepositoryScanCandidate[];
+  parent_dir: string;
+  warning: string | null;
+};
+
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 
 export async function apiRequest<T>(path: string, init: RequestInit = {}) {

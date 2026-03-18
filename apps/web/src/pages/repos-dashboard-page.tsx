@@ -17,6 +17,7 @@ export function ReposDashboardPage(props: { repoId?: string; taskId?: string }) 
     resolveApproval,
     savePolicy,
     scanCandidates,
+    scanWarning,
     rejectApproval,
   } = useOperatorApp();
   const selectedRepository =
@@ -59,6 +60,7 @@ export function ReposDashboardPage(props: { repoId?: string; taskId?: string }) 
               });
             }
           }}
+          warning={scanWarning}
         />
       </section>
 

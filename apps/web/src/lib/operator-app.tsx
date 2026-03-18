@@ -5,6 +5,7 @@ import {
   getApiTargetLabel,
   type RepositoryDetail,
   type RepositoryScanCandidate,
+  type WorkspaceScanResponse,
   type TaskDetail,
   toErrorMessage,
 } from "./operator-api";
@@ -26,6 +27,7 @@ type OperatorAppContextValue = {
     payload: Partial<RepositoryPolicyRecord>,
   ) => Promise<RepositoryDetail | null>;
   scanCandidates: RepositoryScanCandidate[];
+  scanWarning: string | null;
   setNotice: (message: string | null) => void;
   working: string | null;
   resolveApproval: (approvalId: string, scope: ApprovalScope | null) => Promise<TaskDetail | null>;
@@ -37,6 +39,7 @@ const OperatorAppContext = createContext<OperatorAppContextValue | null>(null);
 export function OperatorAppProvider(props: { children: React.ReactNode }) {
   const [repositories, setRepositories] = useState<RepositoryDetail[]>([]);
   const [scanCandidates, setScanCandidates] = useState<RepositoryScanCandidate[]>([]);
+  const [scanWarning, setScanWarning] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState<string | null>(null);
@@ -67,12 +70,11 @@ export function OperatorAppProvider(props: { children: React.ReactNode }) {
   }
 
   async function refreshScanCandidates() {
-    const payload = await apiRequest<{ candidates: RepositoryScanCandidate[] }>("/api/repos/scan", {
-      method: "POST",
-    });
+    const payload = await apiRequest<WorkspaceScanResponse>("/api/repos/scan", { method: "POST" });
 
     startTransition(() => {
       setScanCandidates(payload.candidates);
+      setScanWarning(payload.warning);
     });
   }
 
@@ -193,6 +195,7 @@ export function OperatorAppProvider(props: { children: React.ReactNode }) {
         runAction,
         savePolicy,
         scanCandidates,
+        scanWarning,
         setNotice,
         working,
       }}

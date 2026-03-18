@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdirSync, realpathSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, relative as relativePath, resolve as resolvePath, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
@@ -29,7 +29,11 @@ import {
   updateTaskExecution,
   updateRepositoryPolicy,
 } from "db/runtime";
-import { buildPullRequestDraft } from "github";
+import {
+  buildPullRequestDraft,
+  createGitHubPullRequest,
+  type GitHubPullRequestCreator,
+} from "github";
 import { evaluatePolicyAction } from "policy-engine";
 import {
   approvalScopes,
@@ -69,6 +73,12 @@ export interface ServerApp {
   handleRequest(request: Request): Promise<Response>;
   close(): void;
 }
+
+type WorkspaceScanResult = {
+  parent_dir: string;
+  candidates: RepositoryScanCandidate[];
+  warning: string | null;
+};
 
 type PolicyPatch = Partial<RepositoryPolicyValues>;
 
@@ -164,21 +174,31 @@ type TaskActionResponse = {
 
 export interface CreateServerAppOptions extends Partial<ServerConfig> {
   pi_execute?: PiExecutor;
+  github_create_pull_request?: GitHubPullRequestCreator;
 }
 
 export function createServerApp(options: CreateServerAppOptions = {}): ServerApp {
-  const { pi_execute, ...configOverrides } = options;
+  const { pi_execute, github_create_pull_request, ...configOverrides } = options;
   const config: ServerConfig = {
     ...defaultServerConfig,
     ...configOverrides,
   };
+  try {
+    ensureWorkspaceParentDirectory(config.workspace_parent_dir);
+  } catch {
+    // Startup should stay available even if the workspace parent is misconfigured.
+  }
   const database = bootstrapControlPlaneDatabase({ databasePath: config.database_path });
   const piRuntime: PiRunnerRuntime | undefined = pi_execute ? { execute: pi_execute } : {};
+  const githubCreatePullRequest = github_create_pull_request ?? createGitHubPullRequest;
 
   return {
     config,
     async handleRequest(request) {
-      return routeRequest(request, config, database, piRuntime);
+      return routeRequest(request, config, database, {
+        githubCreatePullRequest,
+        piRuntime,
+      });
     },
     close() {
       database.close();
@@ -190,7 +210,10 @@ async function routeRequest(
   request: Request,
   config: ServerConfig,
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
-  piRuntime?: PiRunnerRuntime,
+  runtime: {
+    piRuntime?: PiRunnerRuntime;
+    githubCreatePullRequest: GitHubPullRequestCreator;
+  },
 ) {
   const url = new URL(request.url);
 
@@ -205,11 +228,12 @@ async function routeRequest(
   }
 
   if (request.method === "POST" && url.pathname === "/api/repos/scan") {
-    const candidates = scanWorkspaceParent(config.workspace_parent_dir, database);
-    return jsonResponse(request, config, 200, {
-      parent_dir: config.workspace_parent_dir,
-      candidates,
-    });
+    return jsonResponse(
+      request,
+      config,
+      200,
+      scanWorkspaceParent(config.workspace_parent_dir, database),
+    );
   }
 
   if (request.method === "POST" && url.pathname === "/api/repos") {
@@ -389,7 +413,7 @@ async function routeRequest(
         config,
         task.task.id,
         "start",
-        piRuntime,
+        runtime.piRuntime,
       );
 
       return jsonResponse(request, config, 201, executedTask);
@@ -428,7 +452,7 @@ async function routeRequest(
       config,
       taskRetryMatch.taskId,
       "retry",
-      piRuntime,
+      runtime.piRuntime,
     );
 
     return jsonResponse(request, config, 200, executedTask);
@@ -464,11 +488,13 @@ async function routeRequest(
     }
 
     try {
-      const result = executeTaskOperatorAction(
+      const result = await executeTaskOperatorAction(
         database,
+        config,
         taskCommitMatch.taskId,
         "commit",
         body && isCommitTaskBody(body) ? body : {},
+        runtime.githubCreatePullRequest,
       );
 
       return jsonResponse(request, config, 200, result);
@@ -492,11 +518,13 @@ async function routeRequest(
     }
 
     try {
-      const result = executeTaskOperatorAction(
+      const result = await executeTaskOperatorAction(
         database,
+        config,
         taskPullRequestMatch.taskId,
         "pull_request",
         body && isCreatePullRequestBody(body) ? body : {},
+        runtime.githubCreatePullRequest,
       );
 
       return jsonResponse(request, config, 200, result);
@@ -600,8 +628,14 @@ async function routeRequest(
 
     const task =
       operatorPayload?.approval_flow === "operator_action"
-        ? executeApprovedOperatorAction(database, resolved.task_id, operatorPayload)
-        : await maybeExecuteTask(database, config, resolved.task_id, "resume", piRuntime);
+        ? await executeApprovedOperatorAction(
+            database,
+            config,
+            resolved.task_id,
+            operatorPayload,
+            runtime.githubCreatePullRequest,
+          )
+        : await maybeExecuteTask(database, config, resolved.task_id, "resume", runtime.piRuntime);
 
     return jsonResponse(request, config, 200, {
       approval: resolved,
@@ -704,23 +738,69 @@ async function routeRequest(
 function scanWorkspaceParent(
   workspaceParentDir: string,
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
-) {
-  const parentRoot = realpathSync(workspaceParentDir);
+): WorkspaceScanResult {
+  try {
+    const parentRoot = realpathSync(workspaceParentDir);
+    const parentStats = statSync(parentRoot);
 
-  return readdirSync(parentRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => inspectRepositoryRoot(resolvePath(parentRoot, entry.name), parentRoot))
-    .filter((candidate): candidate is RepositoryScanCandidate => candidate !== null)
-    .map((candidate) => {
-      const registered = getRepositoryByRootPath(database, candidate.root_path);
+    if (!parentStats.isDirectory()) {
+      throw new Error(`Workspace parent '${parentRoot}' is not a directory.`);
+    }
 
-      return {
-        ...candidate,
-        is_registered: registered !== null,
-        registered_repo_id: registered?.id ?? null,
-      };
-    })
-    .sort((left, right) => left.name.localeCompare(right.name));
+    const candidates = readdirSync(parentRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => inspectRepositoryRoot(resolvePath(parentRoot, entry.name), parentRoot))
+      .filter((candidate): candidate is RepositoryScanCandidate => candidate !== null)
+      .map((candidate) => {
+        const registered = getRepositoryByRootPath(database, candidate.root_path);
+
+        return {
+          ...candidate,
+          is_registered: registered !== null,
+          registered_repo_id: registered?.id ?? null,
+        };
+      })
+      .sort((left, right) => left.name.localeCompare(right.name));
+
+    return {
+      parent_dir: workspaceParentDir,
+      candidates,
+      warning: null,
+    };
+  } catch (error) {
+    return {
+      parent_dir: workspaceParentDir,
+      candidates: [],
+      warning: describeWorkspaceParentError(workspaceParentDir, error),
+    };
+  }
+}
+
+function ensureWorkspaceParentDirectory(workspaceParentDir: string) {
+  mkdirSync(workspaceParentDir, { recursive: true });
+
+  if (!statSync(workspaceParentDir).isDirectory()) {
+    throw new Error(`Workspace parent '${workspaceParentDir}' is not a directory.`);
+  }
+}
+
+function describeWorkspaceParentError(workspaceParentDir: string, error: unknown) {
+  if (isNodeError(error) && error.code === "ENOENT") {
+    return (
+      `Workspace parent '${workspaceParentDir}' does not exist yet. ` +
+      "Run setup or set WORKSPACE_PARENT_DIR to an existing directory."
+    );
+  }
+
+  if (error instanceof Error) {
+    return `Workspace parent '${workspaceParentDir}' is unavailable: ${error.message}`;
+  }
+
+  return `Workspace parent '${workspaceParentDir}' is unavailable right now.`;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error;
 }
 
 function inspectRepositoryRoot(
@@ -1615,12 +1695,14 @@ function getTaskDiff(
   return collectTaskDiff(context);
 }
 
-function executeTaskOperatorAction(
+async function executeTaskOperatorAction(
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  config: ServerConfig,
   taskId: string,
   action: OperatorActionKind,
   body: CommitTaskBody | CreatePullRequestBody,
-): TaskActionResponse {
+  githubCreatePullRequest: GitHubPullRequestCreator,
+): Promise<TaskActionResponse> {
   const context = getTaskExecutionContext(database, taskId);
 
   if (!context) {
@@ -1700,17 +1782,26 @@ function executeTaskOperatorAction(
 
   return {
     approval: null,
-    task: performTaskPullRequestDraft(database, context, branchName, {
-      title: prTitle,
-      body: prBody,
-    }),
+    task: await performTaskPullRequest(
+      database,
+      config,
+      context,
+      branchName,
+      {
+        title: prTitle,
+        body: prBody,
+      },
+      githubCreatePullRequest,
+    ),
   };
 }
 
-function executeApprovedOperatorAction(
+async function executeApprovedOperatorAction(
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  config: ServerConfig,
   taskId: string,
   payload: OperatorActionRequestPayload,
+  githubCreatePullRequest: GitHubPullRequestCreator,
 ) {
   const context = getTaskExecutionContext(database, taskId);
 
@@ -1729,10 +1820,17 @@ function executeApprovedOperatorAction(
         payload.commit_message ?? defaultCommitMessage(context),
       );
     case "pull_request":
-      return performTaskPullRequestDraft(database, context, branchName, {
-        title: payload.pr_title,
-        body: payload.pr_body,
-      });
+      return performTaskPullRequest(
+        database,
+        config,
+        context,
+        branchName,
+        {
+          title: payload.pr_title,
+          body: payload.pr_body,
+        },
+        githubCreatePullRequest,
+      );
   }
 }
 
@@ -1770,7 +1868,7 @@ function requestOperatorApproval(
     requested_action:
       action === "commit"
         ? "Approve committing the task branch."
-        : "Approve generating a pull request draft for the task branch.",
+        : "Approve creating a pull request for the task branch.",
     requested_payload_json: JSON.stringify({
       approval_flow: "operator_action",
       operator_action: action,
@@ -1798,7 +1896,7 @@ function requestOperatorApproval(
     "task.approval.requested",
     action === "commit"
       ? "Task commit is waiting for operator approval."
-      : "Pull request draft generation is waiting for operator approval.",
+      : "Pull request creation is waiting for operator approval.",
     {
       approval_id: approval.id,
       approval_type: approval.approval_type,
@@ -1873,22 +1971,24 @@ function performTaskCommit(
   return detail;
 }
 
-function performTaskPullRequestDraft(
+async function performTaskPullRequest(
   database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  config: ServerConfig,
   context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
   branchName: string,
   overrides: { title: string | null; body: string | null },
+  githubCreatePullRequest: GitHubPullRequestCreator,
 ) {
   const diff = collectTaskDiff(context);
 
   if (diff.has_changes) {
-    throw new Error("Commit the current task changes before creating a pull request draft.");
+    throw new Error("Commit the current task changes before creating a pull request.");
   }
 
   const detail = getTaskDetail(database, context.task.id);
 
   if (!detail) {
-    throw new Error(`Task '${context.task.id}' was not available while drafting the pull request.`);
+    throw new Error(`Task '${context.task.id}' was not available while creating the pull request.`);
   }
 
   const draft = buildPullRequestDraft({
@@ -1902,50 +2002,262 @@ function performTaskPullRequestDraft(
   });
   const title = overrides.title ?? draft.title;
   const body = overrides.body ?? draft.body;
+  const compareUrl = buildGithubCompareUrl(
+    context.repository.github_owner,
+    context.repository.github_repo,
+    draft.base_branch,
+    draft.head_branch,
+  );
+  const pushedHeadSha = pushTaskBranch(database, context, branchName);
+
+  if (context.repository.github_owner && context.repository.github_repo && config.github_token) {
+    try {
+      const pullRequest = await githubCreatePullRequest({
+        token: config.github_token,
+        owner: context.repository.github_owner,
+        repo: context.repository.github_repo,
+        title,
+        body,
+        head_branch: draft.head_branch,
+        base_branch: draft.base_branch,
+        draft: true,
+      });
+
+      return persistPullRequestMetadata(database, context, {
+        artifactSummary: `Created GitHub PR #${pullRequest.number} from ${draft.head_branch} into ${draft.base_branch}.`,
+        auditDetails: {
+          base_branch: draft.base_branch,
+          branch_name: draft.head_branch,
+          compare_url: compareUrl,
+          head_sha: pullRequest.head_sha ?? pushedHeadSha,
+          pr_number: pullRequest.number,
+          pr_url: pullRequest.url,
+        },
+        auditMessage: "Created a GitHub draft pull request from the task branch.",
+        auditType: "task.git.pr_created",
+        metadata: {
+          base_branch: draft.base_branch,
+          body,
+          compare_url: compareUrl,
+          created_at: new Date().toISOString(),
+          draft: pullRequest.draft,
+          error: null,
+          head_branch: draft.head_branch,
+          head_sha: pullRequest.head_sha ?? pushedHeadSha,
+          pr_number: pullRequest.number,
+          pr_url: pullRequest.url,
+          provider: "github",
+          remote_url: context.repository.remote_url,
+          state: pullRequest.state,
+          status: pullRequest.state,
+          title,
+        },
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "GitHub pull request creation failed.";
+
+      recordAuditEvent(
+        database,
+        context.repository.id,
+        context.task.id,
+        "task.git.pr_fallback",
+        "Fell back to local pull request draft metadata after GitHub creation failed.",
+        {
+          base_branch: draft.base_branch,
+          branch_name: draft.head_branch,
+          compare_url: compareUrl,
+          error: message,
+          head_sha: pushedHeadSha,
+        },
+      );
+
+      return persistPullRequestMetadata(database, context, {
+        artifactSummary: `Prepared a fallback PR draft from ${draft.head_branch} into ${draft.base_branch}.`,
+        auditDetails: {
+          base_branch: draft.base_branch,
+          branch_name: draft.head_branch,
+          compare_url: compareUrl,
+          error: message,
+          head_sha: pushedHeadSha,
+        },
+        auditMessage: "Prepared local pull request draft metadata after GitHub creation failed.",
+        auditType: "task.git.pr_drafted",
+        metadata: {
+          base_branch: draft.base_branch,
+          body,
+          compare_url: compareUrl,
+          created_at: new Date().toISOString(),
+          draft: true,
+          error: message,
+          head_branch: draft.head_branch,
+          head_sha: pushedHeadSha,
+          pr_number: null,
+          pr_url: null,
+          provider: "local",
+          remote_url: context.repository.remote_url,
+          state: "draft",
+          status: "drafted_fallback",
+          title,
+        },
+      });
+    }
+  }
+
+  const fallbackReason = config.github_token
+    ? "Repository is missing GitHub remote metadata."
+    : "GITHUB_TOKEN is not configured on the server.";
+
+  recordAuditEvent(
+    database,
+    context.repository.id,
+    context.task.id,
+    "task.git.pr_fallback",
+    "Prepared local pull request draft metadata because real GitHub PR creation is unavailable.",
+    {
+      base_branch: draft.base_branch,
+      branch_name: draft.head_branch,
+      compare_url: compareUrl,
+      error: fallbackReason,
+      head_sha: pushedHeadSha,
+    },
+  );
+
+  return persistPullRequestMetadata(database, context, {
+    artifactSummary: `Prepared a fallback PR draft from ${draft.head_branch} into ${draft.base_branch}.`,
+    auditDetails: {
+      base_branch: draft.base_branch,
+      branch_name: draft.head_branch,
+      compare_url: compareUrl,
+      error: fallbackReason,
+      head_sha: pushedHeadSha,
+    },
+    auditMessage: "Prepared local pull request draft metadata for the task branch.",
+    auditType: "task.git.pr_drafted",
+    metadata: {
+      base_branch: draft.base_branch,
+      body,
+      compare_url: compareUrl,
+      created_at: new Date().toISOString(),
+      draft: true,
+      error: fallbackReason,
+      head_branch: draft.head_branch,
+      head_sha: pushedHeadSha,
+      pr_number: null,
+      pr_url: null,
+      provider: "local",
+      remote_url: context.repository.remote_url,
+      state: "draft",
+      status: "drafted_fallback",
+      title,
+    },
+  });
+}
+
+function pushTaskBranch(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+  branchName: string,
+) {
+  try {
+    runGit(context.repository.root_path, ["push", "--set-upstream", "origin", branchName]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not push the task branch.";
+
+    recordAuditEvent(
+      database,
+      context.repository.id,
+      context.task.id,
+      "task.git.push_failed",
+      "Failed to push the task branch to origin before creating a pull request.",
+      {
+        branch_name: branchName,
+        error: message,
+      },
+    );
+
+    throw new Error(`Could not push task branch '${branchName}' to origin. ${message}`);
+  }
+
   const headSha =
     runGit(context.repository.root_path, ["rev-parse", "--short", "HEAD"])?.trim() ?? "unknown";
-  const compareUrl =
-    context.repository.github_owner && context.repository.github_repo
-      ? `https://github.com/${context.repository.github_owner}/${context.repository.github_repo}/compare/${encodeURIComponent(draft.base_branch)}...${encodeURIComponent(draft.head_branch)}?expand=1`
-      : null;
 
+  recordAuditEvent(
+    database,
+    context.repository.id,
+    context.task.id,
+    "task.git.pushed",
+    "Pushed the task branch to origin before creating a pull request.",
+    {
+      branch_name: branchName,
+      head_sha: headSha,
+    },
+  );
+
+  return headSha;
+}
+
+function persistPullRequestMetadata(
+  database: ReturnType<typeof bootstrapControlPlaneDatabase>,
+  context: NonNullable<ReturnType<typeof getTaskExecutionContext>>,
+  input: {
+    artifactSummary: string;
+    auditType: string;
+    auditMessage: string;
+    auditDetails: Record<string, unknown>;
+    metadata: {
+      base_branch: string;
+      body: string;
+      compare_url: string | null;
+      created_at: string;
+      draft: boolean;
+      error: string | null;
+      head_branch: string;
+      head_sha: string;
+      pr_number: number | null;
+      pr_url: string | null;
+      provider: "github" | "local";
+      remote_url: string | null;
+      state: string;
+      status: string;
+      title: string;
+    };
+  },
+) {
   upsertTaskArtifacts(database, context.task.id, [
     {
       artifact_type: "pr_metadata",
-      summary: `Prepared a PR draft from ${draft.head_branch} into ${draft.base_branch}.`,
-      payload_json: JSON.stringify({
-        base_branch: draft.base_branch,
-        body,
-        compare_url: compareUrl,
-        head_branch: draft.head_branch,
-        head_sha: headSha,
-        remote_url: context.repository.remote_url,
-        status: "drafted",
-        title,
-      }),
+      summary: input.artifactSummary,
+      payload_json: JSON.stringify(input.metadata),
     },
   ]);
   recordAuditEvent(
     database,
     context.repository.id,
     context.task.id,
-    "task.git.pr_drafted",
-    "Prepared a pull request draft from the task branch.",
-    {
-      base_branch: draft.base_branch,
-      branch_name: draft.head_branch,
-      compare_url: compareUrl,
-      head_sha: headSha,
-    },
+    input.auditType,
+    input.auditMessage,
+    input.auditDetails,
   );
 
-  const nextDetail = getTaskDetail(database, context.task.id);
+  const detail = getTaskDetail(database, context.task.id);
 
-  if (!nextDetail) {
-    throw new Error(`Task '${context.task.id}' was not available after drafting the pull request.`);
+  if (!detail) {
+    throw new Error(`Task '${context.task.id}' was not available after creating the pull request.`);
   }
 
-  return nextDetail;
+  return detail;
+}
+
+function buildGithubCompareUrl(
+  owner: string | null,
+  repo: string | null,
+  baseBranch: string,
+  headBranch: string,
+) {
+  return owner && repo
+    ? `https://github.com/${owner}/${repo}/compare/${encodeURIComponent(baseBranch)}...${encodeURIComponent(headBranch)}?expand=1`
+    : null;
 }
 
 function collectTaskDiff(

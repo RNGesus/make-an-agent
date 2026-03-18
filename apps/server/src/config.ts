@@ -10,6 +10,7 @@ export interface ServerConfig {
   http_port: number;
   web_dist_dir: string;
   pi_runner_mode: PiRunnerMode;
+  github_token: string | null;
 }
 
 export const defaultServerConfig: ServerConfig = {
@@ -22,6 +23,7 @@ export const defaultServerConfig: ServerConfig = {
   http_port: 4310,
   web_dist_dir: "apps/web/dist",
   pi_runner_mode: "rpc",
+  github_token: null,
 };
 
 export function readServerConfigFromEnv(
@@ -40,6 +42,7 @@ export function readServerConfigFromEnv(
     http_port: readInteger(env.PORT) ?? defaultServerConfig.http_port,
     web_dist_dir: readNonEmptyString(env.WEB_DIST_DIR) ?? defaultServerConfig.web_dist_dir,
     pi_runner_mode: readPiRunnerMode(env.PI_RUNNER_MODE) ?? defaultServerConfig.pi_runner_mode,
+    github_token: readNonEmptyString(env.GITHUB_TOKEN) ?? defaultServerConfig.github_token,
   };
 }
 

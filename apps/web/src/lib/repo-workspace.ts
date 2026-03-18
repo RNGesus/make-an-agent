@@ -2,6 +2,7 @@ import { startTransition, useEffect, useState } from "react";
 import { useOperatorApp } from "./operator-app";
 import {
   apiRequest,
+  readArtifactValue,
   type TaskActionResult,
   type TaskDetail,
   type TaskDiff,
@@ -145,7 +146,7 @@ export function useRepoWorkspace(repoId: string | null, requestedTaskId?: string
   }
 
   async function createPullRequest(taskId: string) {
-    const result = await runAction("Preparing pull request draft...", () =>
+    const result = await runAction("Creating pull request...", () =>
       apiRequest<TaskActionResult>(`/api/tasks/${encodeURIComponent(taskId)}/pr`, {
         body: JSON.stringify({}),
         method: "POST",
@@ -164,10 +165,16 @@ export function useRepoWorkspace(repoId: string | null, requestedTaskId?: string
 
     await loadTaskDiff(result.task.task.id);
     setSelectedTask(result.task);
+    const pullRequestMetadata = readArtifactValue<{
+      provider?: "github" | "local";
+      status?: string;
+    }>(result.task.artifacts, "pr_metadata");
     setNotice(
       result.approval
         ? `Requested PR approval for ${result.task.task.title}.`
-        : `Prepared a PR draft for ${result.task.task.title}.`,
+        : pullRequestMetadata?.provider === "github"
+          ? `Created a GitHub pull request for ${result.task.task.title}.`
+          : `Prepared fallback PR metadata for ${result.task.task.title}.`,
     );
 
     return result;
