@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
-    "dev": "node --experimental-strip-types src/main.ts",
-    "start": "node --experimental-strip-types src/main.ts",
+    "dev": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --experimental-strip-types src/main.ts",
+    "start": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --experimental-strip-types src/main.ts",
     "test": "vp test"
   },
   "dependencies": {
